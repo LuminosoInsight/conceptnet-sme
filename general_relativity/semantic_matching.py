@@ -24,6 +24,7 @@ from conceptnet5.vectors.transforms import l2_normalize_rows
 RELATION_INDEX = pd.Index(COMMON_RELATIONS)
 N_RELS = len(RELATION_INDEX)
 INITIAL_VECS_FILENAME = 'vectors/mini.h5'
+NEG_SAMPLES = 5
 
 
 random.seed(0)
@@ -68,7 +69,7 @@ def iter_edges_once(filename):
 
 
 class SemanticMatchingModel(nn.Module):
-    def __init__(self, frame, use_cuda=True, relation_dim=8, batch_size=100):
+    def __init__(self, frame, use_cuda=True, relation_dim=10, batch_size=100):
         super().__init__()
         self.n_terms, self.term_dim = frame.shape
         self.relation_dim = relation_dim
@@ -81,12 +82,11 @@ class SemanticMatchingModel(nn.Module):
         self.term_vecs.weight.data.copy_(
             torch.from_numpy(frame.values)
         )
-        self.term_vecs = self.term_vecs.half()
 
         self.assoc_tensor = nn.Bilinear(
             self.term_dim, self.term_dim, self.relation_dim, bias=True
-        ).half()
-        self.rel_vecs = nn.Embedding(N_RELS, self.relation_dim).half()
+        )
+        self.rel_vecs = nn.Embedding(N_RELS, self.relation_dim)
 
         # Using CUDA to run on the GPU requires different data types
         if use_cuda:
@@ -101,14 +101,14 @@ class SemanticMatchingModel(nn.Module):
             self.float_type = torch.FloatTensor
             self.int_type = torch.LongTensor
 
-        self.identity_slice = self.half_type(np.eye(self.term_dim))
+        self.identity_slice = self.float_type(np.eye(self.term_dim))
         self.reset_synonym_relation()
 
         self.truth_multiplier = nn.Parameter(self.float_type([5.]))
         self.truth_offset = nn.Parameter(self.float_type([-3.]))
 
-        self.gender_bias = nn.Linear(self.term_dim, 1, bias=True).half().cuda()
-        self.gender_appropriateness = nn.Linear(self.term_dim, 1, bias=True).half().cuda()
+        self.gender_bias = nn.Linear(self.term_dim, 1, bias=True).cuda()
+        self.gender_appropriateness = nn.Linear(self.term_dim, 1, bias=True).cuda()
 
         self.bias_indices = {
             'gendered': self.precompute_term_indices(GENDERED_WORDS),
@@ -215,6 +215,15 @@ class SemanticMatchingModel(nn.Module):
                 if coin_flip():
                     rel_idx = random.choice(ENTAILED_INDICES[rel])
 
+            except KeyError:
+                continue
+
+            pos_rels.append(rel_idx)
+            pos_left.append(left_idx)
+            pos_right.append(right_idx)
+            weights.append(weight)
+
+            for iter in range(NEG_SAMPLES):
                 corrupt_rel_idx = rel_idx
                 corrupt_left_idx = left_idx
                 corrupt_right_idx = right_idx
@@ -233,24 +242,16 @@ class SemanticMatchingModel(nn.Module):
                     while corrupt_right_idx == right_idx:
                         corrupt_right_idx = random.randrange(self.n_terms)
 
-                pos_rels.append(rel_idx)
-                pos_left.append(left_idx)
-                pos_right.append(right_idx)
-
                 neg_rels.append(corrupt_rel_idx)
                 neg_left.append(corrupt_left_idx)
                 neg_right.append(corrupt_right_idx)
-
-                weights.append(weight)
-            except KeyError:
-                pass
 
             if len(weights) == self.batch_size:
                 break
 
         pos_data = (self.ltvar(pos_rels), self.ltvar(pos_left), self.ltvar(pos_right))
         neg_data = (self.ltvar(neg_rels), self.ltvar(neg_left), self.ltvar(neg_right))
-        weights = autograd.Variable(self.half_type(weights))
+        weights = autograd.Variable(self.float_type(weights))
         return pos_data, neg_data, weights
 
     def make_batches(self, edge_iterator):
@@ -308,6 +309,7 @@ class SemanticMatchingModel(nn.Module):
         optimizer = optim.SGD(self.parameters(), lr=0.1)
         losses = []
         true_target = autograd.Variable(self.float_type([1] * self.batch_size))
+        big_true_target = autograd.Variable(self.float_type([1] * self.batch_size * NEG_SAMPLES))
         false_target = autograd.Variable(self.float_type([0] * self.batch_size))
         steps = 0
         for pos_batch, neg_batch, weights in self.make_batches(
@@ -321,28 +323,33 @@ class SemanticMatchingModel(nn.Module):
             synonym_rel = autograd.Variable(self.int_type([0] * self.batch_size))
             synonym_energy, syn_inter_norm, _ = self(synonym_rel, synonymous, synonymous)
 
-            sem_loss = relative_loss_function(pos_energy, neg_energy, true_target)
-            sem_loss += absolute_loss_function(pos_energy, true_target)
-            sem_loss += absolute_loss_function(neg_energy, false_target)
+            sem_loss = absolute_loss_function(pos_energy, true_target)
             sem_loss += absolute_loss_function(synonym_energy, true_target)
+            for neg_index in range(NEG_SAMPLES):
+                neg_energy_slice = neg_energy[neg_index::NEG_SAMPLES]
+                sem_loss += relative_loss_function(pos_energy, neg_energy_slice, true_target)
+                sem_loss += absolute_loss_function(neg_energy_slice, false_target)
+            
             norm_loss = norm_loss_function(syn_inter_norm, true_target)
-            for this_norm in [pos_inter_norm, pos_rel_norm, neg_inter_norm, neg_rel_norm]:
+            for this_norm in [pos_inter_norm, pos_rel_norm]:
                 norm_loss += one_side_loss_function(true_target, this_norm, true_target)
+            for this_norm in [neg_inter_norm, neg_rel_norm]:
+                norm_loss += one_side_loss_function(big_true_target, this_norm, big_true_target)
 
-            gender_predictions, approp_predictions, gender_vals, approp_vals = self.measure_bias()
-            ones_like_gender = autograd.Variable(torch.ones_like(gender_predictions.data))
-            ones_like_approp = autograd.Variable(torch.ones_like(approp_predictions.data))
-            ones_like_terms = autograd.Variable(torch.ones_like(gender_vals.data))
+            # gender_predictions, approp_predictions, gender_vals, approp_vals = self.measure_bias()
+            # ones_like_gender = autograd.Variable(torch.ones_like(gender_predictions.data))
+            # ones_like_approp = autograd.Variable(torch.ones_like(approp_predictions.data))
+            # ones_like_terms = autograd.Variable(torch.ones_like(gender_vals.data))
 
-            measurement_loss = absolute_loss_function(gender_predictions, ones_like_gender)
-            measurement_loss += absolute_loss_function(approp_predictions, ones_like_approp)
-            prejudice_loss = one_side_loss_function(approp_vals, gender_vals, ones_like_terms)
-            prejudice_loss += one_side_loss_function(gender_vals, -approp_vals, ones_like_terms)
+            # measurement_loss = absolute_loss_function(gender_predictions, ones_like_gender)
+            # measurement_loss += absolute_loss_function(approp_predictions, ones_like_approp)
+            # prejudice_loss = one_side_loss_function(approp_vals, gender_vals, ones_like_terms)
+            # prejudice_loss += one_side_loss_function(gender_vals, -approp_vals, ones_like_terms)
 
-            loss = sem_loss + norm_loss + measurement_loss + prejudice_loss
+            loss = sem_loss + norm_loss
             loss.backward()
 
-            nn.utils.clip_grad_norm(self.parameters(), 10)
+            nn.utils.clip_grad_norm(self.parameters(), 100)
             optimizer.step()
             self.reset_synonym_relation()
 
@@ -352,8 +359,8 @@ class SemanticMatchingModel(nn.Module):
                 self.show_debug(neg_batch, neg_energy, False)
                 self.show_debug(pos_batch, pos_energy, True)
                 avg_loss = np.mean(losses)
-                print("%d steps, loss=%4.4f, sem=%4.4f, norm=%4.4f, measure=%4.4f, prejudice=%4.4f" % (
-                    steps, avg_loss, sem_loss.data[0], norm_loss.data[0], measurement_loss.data[0], prejudice_loss.data[0]
+                print("%d steps, loss=%4.4f, sem=%4.4f, norm=%4.4f" % (
+                    steps, avg_loss, sem_loss.data[0], norm_loss.data[0]
                 ))
                 losses.clear()
             if steps % 5000 == 0:

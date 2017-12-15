@@ -22,7 +22,7 @@ from conceptnet5.vectors.transforms import l2_normalize_rows
 
 RELATION_INDEX = pd.Index(COMMON_RELATIONS)
 N_RELS = len(RELATION_INDEX)
-INITIAL_VECS_FILENAME = 'vectors/mini.h5'
+INITIAL_VECS_FILENAME = 'vectors/numberbatch-biased.h5'
 TARGET_FILENAME = 'vectors/cdistmult.model'
 
 random.seed(0)
@@ -105,13 +105,6 @@ class SemanticMatchingModel(nn.Module):
         self.reset_synonym_relation()
         self.truth_offset = nn.Parameter(self.float_type([-3.]))
 
-        self.bias_indices = {
-            'gendered': self.precompute_term_indices(GENDERED_WORDS),
-            'neutral': self.precompute_term_indices(GENDER_NEUTRAL_WORDS),
-            'female': self.precompute_term_indices(FEMALE_WORDS),
-            'male': self.precompute_term_indices(MALE_WORDS),
-        }
-
     def precompute_term_indices(self, terms, language='en'):
         return self.ltvar(
             [
@@ -152,8 +145,10 @@ class SemanticMatchingModel(nn.Module):
         term_norm_L = self.complex_norm(terms_L_r, terms_L_i)
         term_norm_R = self.complex_norm(terms_R_r, terms_R_i)
 
+        # temporary: a non-trainable multiplier to allow the system to be
+        # more confident. It's non-trainable so I don't have to start over.
         return (
-            energy.float() + self.truth_offset,
+            (energy.float() + self.truth_offset) * 6,
             term_norm_L.float(),
             term_norm_R.float()
         )
