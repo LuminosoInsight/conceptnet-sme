@@ -23,7 +23,8 @@ from conceptnet5.vectors.transforms import l2_normalize_rows
 
 RELATION_INDEX = pd.Index(COMMON_RELATIONS)
 N_RELS = len(RELATION_INDEX)
-INITIAL_VECS_FILENAME = 'vectors/mini.h5'
+INITIAL_VECS_FILENAME = get_data_filename('vectors/numberbatch-biased.h5')
+MODEL_FILENAME = get_data_filename('vectors/sme.model')
 NEG_SAMPLES = 5
 
 
@@ -90,14 +91,12 @@ class SemanticMatchingModel(nn.Module):
 
         # Using CUDA to run on the GPU requires different data types
         if use_cuda:
-            self.half_type = torch.cuda.HalfTensor
             self.float_type = torch.cuda.FloatTensor
             self.int_type = torch.cuda.LongTensor
             self.term_vecs = self.term_vecs.cuda()
             self.rel_vecs = self.rel_vecs.cuda()
             self.assoc_tensor = self.assoc_tensor.cuda()
         else:
-            self.half_type = torch.HalfTensor
             self.float_type = torch.FloatTensor
             self.int_type = torch.LongTensor
 
@@ -131,34 +130,57 @@ class SemanticMatchingModel(nn.Module):
         self.rel_vecs.weight.data[0, :] = 0
         self.rel_vecs.weight.data[0, 0] = 1
 
+        related_mat = torch.sum(self.assoc_tensor.weight * self.rel_vecs.weight[1].unsqueeze(1).unsqueeze(2), 0).data
+        related_mat[range(self.term_dim), range(self.term_dim)] = 0.
+        self.related_mat = autograd.Variable(self.float_type(related_mat), requires_grad=False)
+
     def forward(self, rels, terms_L, terms_R):
         # Get relation vectors for the whole batch, with shape (b, i)
         rels_b_i = self.rel_vecs(rels)
-        # Get left term vectors for the whole batch, with shape (b, j)
-        terms_b_j = self.term_vecs(terms_L)
-        # Get right term vectors for the whole batch, with shape (b, k)
-        terms_b_k = self.term_vecs(terms_R)
+        # Get left term vectors for the whole batch, with shape (b, L)
+        terms_b_L = self.term_vecs(terms_L)
+        # Get right term vectors for the whole batch, with shape (b, R)
+        terms_b_R = self.term_vecs(terms_R)
 
         # Get the interaction of the terms in relation-embedding space, with
         # shape (b, i).
-        inter_b_i = self.assoc_tensor(terms_b_j, terms_b_k)
+        inter_b_i = self.assoc_tensor(terms_b_L, terms_b_R)
 
         # Multiply our (b * i) term elementwise by rels_b_i. This indicates
-        # how well the interaction between term j and term k matches each
+        # how well the interaction between term L and term R matches each
         # component of the relation vector.
         relmatch_b_i = inter_b_i * rels_b_i
 
         # Add up the components for each item in the batch
         energy_b = torch.sum(relmatch_b_i, 1)
 
-        norm_inter_b = torch.sum(inter_b_i * inter_b_i, 1)
-        norm_rel_b = torch.sum(rels_b_i * rels_b_i, 1)
+        return energy_b * self.truth_multiplier + self.truth_offset
 
-        return (
-            energy_b.float() * self.truth_multiplier + self.truth_offset,
-            norm_inter_b.float(),
-            norm_rel_b.float(),
-        )
+    def forward_corrupt(self, rels, terms_L, terms_R):
+        # Generate corrupt versions of the term vectors that are vaguely related
+        # but not similar, and return the matching energy when corrupting the
+        # left term or the right term. We want this energy to be low.
+        rels_b_i = self.rel_vecs(rels)
+        terms_b_L = self.term_vecs(terms_L)
+        terms_b_R = self.term_vecs(terms_R)
+
+        related_b_L = torch.matmul(terms_b_L, self.related_mat)
+        dist_b_L = torch.sqrt(torch.sum((related_b_L - terms_b_L) ** 2, 1, keepdim=True))
+        noise_b_L = autograd.Variable(self.float_type(np.random.normal(size=related_b_L.shape)), requires_grad=False)
+        corrupt_b_L = related_b_L + noise_b_L * dist_b_L / (self.term_dim ** 0.5)
+
+        related_b_R = torch.matmul(terms_b_R, self.related_mat)
+        dist_b_R = torch.sqrt(torch.sum((related_b_R - terms_b_R) ** 2, 1, keepdim=True))
+        noise_b_R = autograd.Variable(self.float_type(np.random.normal(size=related_b_R.shape)), requires_grad=False)
+        corrupt_b_R = related_b_R + noise_b_R * dist_b_R / (self.term_dim ** 0.5)
+
+        inter_b_i_L = self.assoc_tensor(corrupt_b_L, terms_b_R)
+        inter_b_i_R = self.assoc_tensor(terms_b_L, corrupt_b_R)
+        relmatch_b_i_L = inter_b_i_L * rels_b_i
+        relmatch_b_i_R = inter_b_i_R * rels_b_i
+        relmatch_2b_i = torch.cat((relmatch_b_i_L, relmatch_b_i_R))
+        energy_2b = torch.sum(relmatch_2b_i, 1)
+        return energy_2b * self.truth_multiplier + self.truth_offset
 
     def measure_bias(self):
         # Train our predictors to recognize gender distinctions in term vectors
@@ -203,8 +225,7 @@ class SemanticMatchingModel(nn.Module):
                 right = uri_prefix(right)
 
                 # Possibly swap the sides of a relation
-                if coin_flip():
-                    rel = reverse_relation(rel)
+                if coin_flip() and rel in SYMMETRIC_RELATIONS:
                     left, right = right, left
 
                 rel_idx = RELATION_INDEX.get_loc(rel)
@@ -214,6 +235,7 @@ class SemanticMatchingModel(nn.Module):
                 # Possibly replace a relation with a more general relation
                 if coin_flip():
                     rel_idx = random.choice(ENTAILED_INDICES[rel])
+                    rel = COMMON_RELATIONS[rel_idx]
 
             except KeyError:
                 continue
@@ -274,7 +296,7 @@ class SemanticMatchingModel(nn.Module):
 
     @staticmethod
     def load_model(filename):
-        frame = load_hdf(get_data_filename(INITIAL_VECS_FILENAME))
+        frame = load_hdf(INITIAL_VECS_FILENAME)
         model = SemanticMatchingModel(l2_normalize_rows(frame.astype(np.float32)))
         model.load_state_dict(torch.load(filename))
         return model
@@ -292,7 +314,7 @@ class SemanticMatchingModel(nn.Module):
             except KeyError:
                 continue
 
-            model_output, _, _ = self(self.ltvar([rel_idx]), self.ltvar([left_idx]), self.ltvar([right_idx]))
+            model_output = self(self.ltvar([rel_idx]), self.ltvar([left_idx]), self.ltvar([right_idx]))
             value = model_output.data[0]
             assertion = assertion_uri(rel, left, right)
             if value < cutoff_value:
@@ -301,55 +323,37 @@ class SemanticMatchingModel(nn.Module):
                 print("%4.4f\t%s" % (value, assertion), file=out)
 
     def train(self):
-        relative_loss_function = nn.MarginRankingLoss(margin=0.5)
+        relative_loss_function = nn.MarginRankingLoss(margin=1)
         absolute_loss_function = nn.BCEWithLogitsLoss()
         one_side_loss_function = nn.MarginRankingLoss(margin=0)
-        norm_loss_function = nn.MSELoss()
 
-        optimizer = optim.SGD(self.parameters(), lr=0.1)
+        optimizer = optim.SGD(self.parameters(), lr=0.1, weight_decay=1e-9)
         losses = []
         true_target = autograd.Variable(self.float_type([1] * self.batch_size))
-        big_true_target = autograd.Variable(self.float_type([1] * self.batch_size * NEG_SAMPLES))
         false_target = autograd.Variable(self.float_type([0] * self.batch_size))
+        big_false_target = autograd.Variable(self.float_type([0] * self.batch_size * 2))
         steps = 0
         for pos_batch, neg_batch, weights in self.make_batches(
             iter_edges_forever(get_data_filename('collated/sorted/edges-shuf.csv'))
         ):
             self.zero_grad()
-            pos_energy, pos_inter_norm, pos_rel_norm = self(*pos_batch)
-            neg_energy, neg_inter_norm, neg_rel_norm = self(*neg_batch)
-
-            synonymous = pos_batch[1]
-            synonym_rel = autograd.Variable(self.int_type([0] * self.batch_size))
-            synonym_energy, syn_inter_norm, _ = self(synonym_rel, synonymous, synonymous)
+            pos_energy = self(*pos_batch)
+            neg_energy = self(*neg_batch)
+            corrupt_energy = self.forward_corrupt(*pos_batch)
 
             sem_loss = absolute_loss_function(pos_energy, true_target)
-            sem_loss += absolute_loss_function(synonym_energy, true_target)
             for neg_index in range(NEG_SAMPLES):
                 neg_energy_slice = neg_energy[neg_index::NEG_SAMPLES]
                 sem_loss += relative_loss_function(pos_energy, neg_energy_slice, true_target)
                 sem_loss += absolute_loss_function(neg_energy_slice, false_target)
-            
-            norm_loss = norm_loss_function(syn_inter_norm, true_target)
-            for this_norm in [pos_inter_norm, pos_rel_norm]:
-                norm_loss += one_side_loss_function(true_target, this_norm, true_target)
-            for this_norm in [neg_inter_norm, neg_rel_norm]:
-                norm_loss += one_side_loss_function(big_true_target, this_norm, big_true_target)
+            corrupt_loss = absolute_loss_function(corrupt_energy, big_false_target)
+            # corrupt_loss = one_side_loss_function(pos_energy, corrupt_energy[:self.batch_size], true_target)
+            # corrupt_loss += one_side_loss_function(pos_energy, corrupt_energy[self.batch_size:], true_target)
 
-            # gender_predictions, approp_predictions, gender_vals, approp_vals = self.measure_bias()
-            # ones_like_gender = autograd.Variable(torch.ones_like(gender_predictions.data))
-            # ones_like_approp = autograd.Variable(torch.ones_like(approp_predictions.data))
-            # ones_like_terms = autograd.Variable(torch.ones_like(gender_vals.data))
-
-            # measurement_loss = absolute_loss_function(gender_predictions, ones_like_gender)
-            # measurement_loss += absolute_loss_function(approp_predictions, ones_like_approp)
-            # prejudice_loss = one_side_loss_function(approp_vals, gender_vals, ones_like_terms)
-            # prejudice_loss += one_side_loss_function(gender_vals, -approp_vals, ones_like_terms)
-
-            loss = sem_loss + norm_loss
+            loss = sem_loss    # + corrupt_loss
             loss.backward()
 
-            nn.utils.clip_grad_norm(self.parameters(), 100)
+            nn.utils.clip_grad_norm(self.parameters(), 1)
             optimizer.step()
             self.reset_synonym_relation()
 
@@ -359,12 +363,12 @@ class SemanticMatchingModel(nn.Module):
                 self.show_debug(neg_batch, neg_energy, False)
                 self.show_debug(pos_batch, pos_energy, True)
                 avg_loss = np.mean(losses)
-                print("%d steps, loss=%4.4f, sem=%4.4f, norm=%4.4f" % (
-                    steps, avg_loss, sem_loss.data[0], norm_loss.data[0]
+                print("%d steps, loss=%4.4f, sem=%4.4f, corrupt=%4.4f" % (
+                    steps, avg_loss, sem_loss, corrupt_loss
                 ))
                 losses.clear()
             if steps % 5000 == 0:
-                torch.save(self.state_dict(), 'data/vectors/sme.model')
+                torch.save(self.state_dict(), MODEL_FILENAME)
                 print("saved")
         print()
 
@@ -384,8 +388,8 @@ class SemanticMatchingModel(nn.Module):
 
 
 def get_model():
-    if os.access(get_data_filename('vectors/sme.model'), os.F_OK):
-        model = SemanticMatchingModel.load_model(get_data_filename('vectors/sme.model'))
+    if os.access(MODEL_FILENAME, os.F_OK):
+        model = SemanticMatchingModel.load_model(MODEL_FILENAME)
     else:
         frame = load_hdf(get_data_filename(INITIAL_VECS_FILENAME))
         model = SemanticMatchingModel(l2_normalize_rows(frame.astype(np.float32)))
