@@ -69,6 +69,13 @@ def iter_edges_once(filename):
         yield (relation, concept1, concept2, 1.)
 
 
+def inappropriateness_loss(bias_vals, appropriateness_vals):
+    weights = torch.clamp(torch.tanh(-appropriateness_vals), 0, 1)
+    weights /= torch.sum(weights)
+    weighted_mse = torch.sum(weights * bias_vals ** 2)
+    return weighted_mse
+
+
 class SemanticMatchingModel(nn.Module):
     def __init__(self, frame, use_cuda=True, relation_dim=10, batch_size=100):
         super().__init__()
@@ -331,7 +338,6 @@ class SemanticMatchingModel(nn.Module):
         losses = []
         true_target = autograd.Variable(self.float_type([1] * self.batch_size))
         false_target = autograd.Variable(self.float_type([0] * self.batch_size))
-        big_false_target = autograd.Variable(self.float_type([0] * self.batch_size * 2))
         steps = 0
         for pos_batch, neg_batch, weights in self.make_batches(
             iter_edges_forever(get_data_filename('collated/sorted/edges-shuf.csv'))
@@ -339,18 +345,23 @@ class SemanticMatchingModel(nn.Module):
             self.zero_grad()
             pos_energy = self(*pos_batch)
             neg_energy = self(*neg_batch)
-            corrupt_energy = self.forward_corrupt(*pos_batch)
 
             sem_loss = absolute_loss_function(pos_energy, true_target)
             for neg_index in range(NEG_SAMPLES):
                 neg_energy_slice = neg_energy[neg_index::NEG_SAMPLES]
                 sem_loss += relative_loss_function(pos_energy, neg_energy_slice, true_target)
                 sem_loss += absolute_loss_function(neg_energy_slice, false_target)
-            corrupt_loss = absolute_loss_function(corrupt_energy, big_false_target)
-            # corrupt_loss = one_side_loss_function(pos_energy, corrupt_energy[:self.batch_size], true_target)
-            # corrupt_loss += one_side_loss_function(pos_energy, corrupt_energy[self.batch_size:], true_target)
 
-            loss = sem_loss    # + corrupt_loss
+            gender_predictions, approp_predictions, gender_vals, approp_vals = self.measure_bias()
+            ones_like_gender = autograd.Variable(torch.ones_like(gender_predictions.data))
+            ones_like_approp = autograd.Variable(torch.ones_like(approp_predictions.data))
+
+            measurement_loss = absolute_loss_function(gender_predictions, ones_like_gender)
+            measurement_loss += absolute_loss_function(approp_predictions, ones_like_approp)
+
+            prejudice_loss = inappropriateness_loss(gender_vals, approp_vals)
+
+            loss = sem_loss + measurement_loss * 10 + prejudice_loss
             loss.backward()
 
             nn.utils.clip_grad_norm(self.parameters(), 1)
@@ -363,8 +374,8 @@ class SemanticMatchingModel(nn.Module):
                 self.show_debug(neg_batch, neg_energy, False)
                 self.show_debug(pos_batch, pos_energy, True)
                 avg_loss = np.mean(losses)
-                print("%d steps, loss=%4.4f, sem=%4.4f, corrupt=%4.4f" % (
-                    steps, avg_loss, sem_loss, corrupt_loss
+                print("%d steps, loss=%4.4f, sem=%4.4f, measure=%4.4f, prej=%4.4f" % (
+                    steps, avg_loss, sem_loss, measurement_loss * 10, prejudice_loss
                 ))
                 losses.clear()
             if steps % 5000 == 0:
@@ -376,12 +387,21 @@ class SemanticMatchingModel(nn.Module):
         path = pathlib.Path(dirname)
         term_mat = self.term_vecs.weight.data.float().cpu().numpy()
         term_frame = pd.DataFrame(term_mat, index=self.index)
-        save_hdf(term_frame, str(path / "terms.h5"))
+        save_hdf(term_frame, str(path / "terms-similar.h5"))
+
         rel_mat = self.rel_vecs.weight.data.float().cpu().numpy()
         rel_frame = pd.DataFrame(rel_mat, index=RELATION_INDEX)
+
         save_hdf(rel_frame, str(path / "relations.h5"))
         assoc_t = self.assoc_tensor.weight.data.float().cpu().numpy()
         save_npy(assoc_t, str(path / "assoc.npy"))
+
+        rel_vec = rel_mat[1]
+        related_mat = np.einsum('i,ijk->jk', rel_vec, assoc_t)
+        related_mat = (related_mat + related_mat.T) / 2
+        related_terms = term_frame.dot(related_mat)
+        save_hdf(related_terms, str(path / "terms-related.h5"))
+
 
     def ltvar(self, numbers):
         return autograd.Variable(self.int_type(numbers))
