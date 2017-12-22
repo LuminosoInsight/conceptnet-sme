@@ -15,16 +15,18 @@ from general_relativity.relations import (
 )
 from conceptnet5.vectors.debias import GENDERED_WORDS, GENDER_NEUTRAL_WORDS, MALE_WORDS, FEMALE_WORDS
 from conceptnet5.uri import uri_prefix, assertion_uri
-from conceptnet5.nodes import standardized_concept_uri
+from conceptnet5.nodes import standardized_concept_uri, get_language
 from conceptnet5.util import get_data_filename
 from conceptnet5.vectors.formats import load_hdf
 from conceptnet5.vectors.transforms import l2_normalize_rows
+from conceptnet5.languages import CORE_LANGUAGES
 
 
 RELATION_INDEX = pd.Index(COMMON_RELATIONS)
 N_RELS = len(RELATION_INDEX)
 INITIAL_VECS_FILENAME = get_data_filename('vectors/numberbatch-biased.h5')
 MODEL_FILENAME = get_data_filename('vectors/sme.model')
+EMBEDDING_DIMS = 500
 NEG_SAMPLES = 5
 
 
@@ -412,6 +414,10 @@ def get_model():
         model = SemanticMatchingModel.load_model(MODEL_FILENAME)
     else:
         frame = load_hdf(get_data_filename(INITIAL_VECS_FILENAME))
+        frame = pd.DataFrame(frame, columns=range(EMBEDDING_DIMS)).fillna(0)
+        terms = [term for term in frame.index if get_language(term) in CORE_LANGUAGES and term.count('_') == 0]
+        frame = frame.loc[terms]
+        print(frame.shape)
         model = SemanticMatchingModel(l2_normalize_rows(frame.astype(np.float32)))
     return model
 
