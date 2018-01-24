@@ -29,8 +29,7 @@ MODEL_FILENAME = get_data_filename('sme/sme.model')
 NEG_SAMPLES = 5
 LANGUAGES_TO_USE = [
     'en', 'fr', 'de', 'it', 'es', 'ru', 'pt', 'ja', 'zh', 'nl',
-    'ar', 'bn', 'ca', 'cs', 'da', 'fa', 'el', 'fi', 'he', 'hi', 'hu',
-    'ko', 'mk', 'ms', 'no', 'pl', 'ro', 'sh', 'sv', 'tr', 'uk', 'mul'
+    'ar', 'fa', 'ko', 'ms', 'no', 'pl', 'sv', 'mul'
 ]
 
 random.seed(0)
@@ -118,16 +117,6 @@ class SemanticMatchingModel(nn.Module):
         self.truth_multiplier = nn.Parameter(self.float_type([5.]))
         self.truth_offset = nn.Parameter(self.float_type([-3.]))
 
-        self.gender_bias = nn.Linear(self.term_dim, 1, bias=True).cuda()
-        self.gender_appropriateness = nn.Linear(self.term_dim, 1, bias=True).cuda()
-
-        self.bias_indices = {
-            'gendered': self.precompute_term_indices(GENDERED_WORDS),
-            'neutral': self.precompute_term_indices(GENDER_NEUTRAL_WORDS),
-            'female': self.precompute_term_indices(FEMALE_WORDS),
-            'male': self.precompute_term_indices(MALE_WORDS),
-        }
-
     def precompute_term_indices(self, terms, language='en'):
         return self.ltvar(
             [
@@ -141,10 +130,6 @@ class SemanticMatchingModel(nn.Module):
         self.assoc_tensor.weight.data[0] = self.identity_slice
         self.rel_vecs.weight.data[0, :] = 0
         self.rel_vecs.weight.data[0, 0] = 1
-
-        related_mat = torch.sum(self.assoc_tensor.weight * self.rel_vecs.weight[1].unsqueeze(1).unsqueeze(2), 0).data
-        related_mat[range(self.term_dim), range(self.term_dim)] = 0.
-        self.related_mat = autograd.Variable(self.float_type(related_mat), requires_grad=False)
 
     def forward(self, rels, terms_L, terms_R):
         # Get relation vectors for the whole batch, with shape (b, i)
@@ -167,53 +152,6 @@ class SemanticMatchingModel(nn.Module):
         energy_b = torch.sum(relmatch_b_i, 1)
 
         return energy_b * self.truth_multiplier + self.truth_offset
-
-    def forward_corrupt(self, rels, terms_L, terms_R):
-        # Generate corrupt versions of the term vectors that are vaguely related
-        # but not similar, and return the matching energy when corrupting the
-        # left term or the right term. We want this energy to be low.
-        rels_b_i = self.rel_vecs(rels)
-        terms_b_L = self.term_vecs(terms_L)
-        terms_b_R = self.term_vecs(terms_R)
-
-        related_b_L = torch.matmul(terms_b_L, self.related_mat)
-        dist_b_L = torch.sqrt(torch.sum((related_b_L - terms_b_L) ** 2, 1, keepdim=True))
-        noise_b_L = autograd.Variable(self.float_type(np.random.normal(size=related_b_L.shape)), requires_grad=False)
-        corrupt_b_L = related_b_L + noise_b_L * dist_b_L / (self.term_dim ** 0.5)
-
-        related_b_R = torch.matmul(terms_b_R, self.related_mat)
-        dist_b_R = torch.sqrt(torch.sum((related_b_R - terms_b_R) ** 2, 1, keepdim=True))
-        noise_b_R = autograd.Variable(self.float_type(np.random.normal(size=related_b_R.shape)), requires_grad=False)
-        corrupt_b_R = related_b_R + noise_b_R * dist_b_R / (self.term_dim ** 0.5)
-
-        inter_b_i_L = self.assoc_tensor(corrupt_b_L, terms_b_R)
-        inter_b_i_R = self.assoc_tensor(terms_b_L, corrupt_b_R)
-        relmatch_b_i_L = inter_b_i_L * rels_b_i
-        relmatch_b_i_R = inter_b_i_R * rels_b_i
-        relmatch_2b_i = torch.cat((relmatch_b_i_L, relmatch_b_i_R))
-        energy_2b = torch.sum(relmatch_2b_i, 1)
-        return energy_2b * self.truth_multiplier + self.truth_offset
-
-    def measure_bias(self):
-        # Train our predictors to recognize gender distinctions in term vectors
-        gendered_vecs = self.term_vecs(self.bias_indices['gendered']).detach()
-        gendered_batch = self.gender_appropriateness(gendered_vecs)
-        neutral_vecs = self.term_vecs(self.bias_indices['neutral']).detach()
-        neutral_batch = -self.gender_appropriateness(neutral_vecs)
-        female_vecs = self.term_vecs(self.bias_indices['female']).detach()
-        female_batch = self.gender_bias(female_vecs)
-        male_vecs = self.term_vecs(self.bias_indices['male']).detach()
-        male_batch = -self.gender_bias(male_vecs)
-
-        all_terms_gender = self.gender_bias(self.term_vecs.weight)
-        all_terms_appropriateness = self.gender_appropriateness(self.term_vecs.weight)
-
-        return (
-            torch.cat((female_batch, male_batch)).float(),
-            torch.cat((gendered_batch, neutral_batch)).float(),
-            all_terms_gender.float(),
-            all_terms_appropriateness.float()
-        )
 
     def positive_negative_batch(self, edge_iterator):
         pos_rels = []
@@ -315,7 +253,7 @@ class SemanticMatchingModel(nn.Module):
         ]
         frame = frame.loc[labels]
         return frame.astype(np.float32)
-    
+
     @staticmethod
     def load_model(filename):
         frame = SemanticMatchingModel.load_initial_frame()
@@ -361,22 +299,14 @@ class SemanticMatchingModel(nn.Module):
             pos_energy = self(*pos_batch)
             neg_energy = self(*neg_batch)
 
-            sem_loss = absolute_loss_function(pos_energy, true_target)
+            abs_loss = absolute_loss_function(pos_energy, true_target)
+            rel_loss = 0
             for neg_index in range(NEG_SAMPLES):
                 neg_energy_slice = neg_energy[neg_index::NEG_SAMPLES]
-                sem_loss += relative_loss_function(pos_energy, neg_energy_slice, true_target)
-                sem_loss += absolute_loss_function(neg_energy_slice, false_target)
+                rel_loss += relative_loss_function(pos_energy, neg_energy_slice, true_target)
+                abs_loss += absolute_loss_function(neg_energy_slice, false_target)
 
-            gender_predictions, approp_predictions, gender_vals, approp_vals = self.measure_bias()
-            ones_like_gender = autograd.Variable(torch.ones_like(gender_predictions.data))
-            ones_like_approp = autograd.Variable(torch.ones_like(approp_predictions.data))
-
-            measurement_loss = absolute_loss_function(gender_predictions, ones_like_gender)
-            measurement_loss += absolute_loss_function(approp_predictions, ones_like_approp)
-
-            prejudice_loss = inappropriateness_loss(gender_vals, approp_vals)
-
-            loss = sem_loss + measurement_loss * 10 + prejudice_loss
+            loss = abs_loss + rel_loss
             loss.backward()
 
             nn.utils.clip_grad_norm(self.parameters(), 1)
@@ -389,8 +319,8 @@ class SemanticMatchingModel(nn.Module):
                 self.show_debug(neg_batch, neg_energy, False)
                 self.show_debug(pos_batch, pos_energy, True)
                 avg_loss = np.mean(losses)
-                print("%d steps, loss=%4.4f, sem=%4.4f, measure=%4.4f, prej=%4.4f" % (
-                    steps, avg_loss, sem_loss, measurement_loss * 10, prejudice_loss
+                print("%d steps, loss=%4.4f, abs=%4.4f, rel=%4.4f" % (
+                    steps, avg_loss, abs_loss, rel_loss
                 ))
                 losses.clear()
             if steps % 5000 == 0:
