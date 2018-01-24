@@ -13,9 +13,10 @@ from general_relativity.relations import (
     COMMON_RELATIONS, ALL_RELATIONS, SYMMETRIC_RELATIONS, ENTAILED_RELATIONS,
     reverse_relation
 )
+from conceptnet5.languages import CORE_LANGUAGES
 from conceptnet5.vectors.debias import GENDERED_WORDS, GENDER_NEUTRAL_WORDS, MALE_WORDS, FEMALE_WORDS
 from conceptnet5.uri import uri_prefix, assertion_uri
-from conceptnet5.nodes import standardized_concept_uri
+from conceptnet5.nodes import standardized_concept_uri, get_uri_language
 from conceptnet5.util import get_data_filename
 from conceptnet5.vectors.formats import load_hdf
 from conceptnet5.vectors.transforms import l2_normalize_rows
@@ -23,10 +24,14 @@ from conceptnet5.vectors.transforms import l2_normalize_rows
 
 RELATION_INDEX = pd.Index(COMMON_RELATIONS)
 N_RELS = len(RELATION_INDEX)
-INITIAL_VECS_FILENAME = get_data_filename('vectors/numberbatch-biased.h5')
-MODEL_FILENAME = get_data_filename('vectors/sme.model')
+INITIAL_VECS_FILENAME = get_data_filename('vectors-20180108/numberbatch-biased.h5')
+MODEL_FILENAME = get_data_filename('sme/sme.model')
 NEG_SAMPLES = 5
-
+LANGUAGES_TO_USE = [
+    'en', 'fr', 'de', 'it', 'es', 'ru', 'pt', 'ja', 'zh', 'nl',
+    'ar', 'bn', 'ca', 'cs', 'da', 'fa', 'el', 'fi', 'he', 'hi', 'hu',
+    'ko', 'mk', 'ms', 'no', 'pl', 'ro', 'sh', 'sv', 'tr', 'uk', 'mul'
+]
 
 random.seed(0)
 
@@ -302,9 +307,19 @@ class SemanticMatchingModel(nn.Module):
             print("[%4.4f] %s %s %s" % (value, rel, left, right))
 
     @staticmethod
-    def load_model(filename):
+    def load_initial_frame():
         frame = load_hdf(INITIAL_VECS_FILENAME)
-        model = SemanticMatchingModel(l2_normalize_rows(frame.astype(np.float32)))
+        labels = [
+            label for label in frame.index
+            if get_uri_language(label) in LANGUAGES_TO_USE
+        ]
+        frame = frame.loc[labels]
+        return frame.astype(np.float32)
+    
+    @staticmethod
+    def load_model(filename):
+        frame = SemanticMatchingModel.load_initial_frame()
+        model = SemanticMatchingModel(l2_normalize_rows(frame))
         model.load_state_dict(torch.load(filename))
         return model
 
@@ -411,8 +426,8 @@ def get_model():
     if os.access(MODEL_FILENAME, os.F_OK):
         model = SemanticMatchingModel.load_model(MODEL_FILENAME)
     else:
-        frame = load_hdf(get_data_filename(INITIAL_VECS_FILENAME))
-        model = SemanticMatchingModel(l2_normalize_rows(frame.astype(np.float32)))
+        frame = SemanticMatchingModel.load_initial_frame()
+        model = SemanticMatchingModel(l2_normalize_rows(frame))
     return model
 
 
