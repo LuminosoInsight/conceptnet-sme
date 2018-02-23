@@ -12,8 +12,7 @@ import os
 from conceptnet_sme.relations import (
     COMMON_RELATIONS, ALL_RELATIONS, SYMMETRIC_RELATIONS, ENTAILED_RELATIONS,
 )
-from conceptnet5.uri import uri_prefix, assertion_uri
-from conceptnet5.nodes import get_uri_language
+from conceptnet5.uri import uri_prefix, assertion_uri, get_uri_language
 from conceptnet5.util import get_data_filename
 from conceptnet5.vectors.formats import load_hdf
 from conceptnet5.vectors.transforms import l2_normalize_rows
