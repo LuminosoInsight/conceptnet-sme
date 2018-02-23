@@ -106,7 +106,8 @@ class SemanticMatchingModel(nn.Module):
         Unlike SME as published, this can differ from the dimensionality of
         the term embeddings.
 
-        `batch_size`: how many positive and neg
+        `batch_size`: how many positive examples to use in each batch.
+        The number of negative examples is NEG_SAMPLES times batch_size.
         """
         super().__init__()
         self.n_terms, self.term_dim = frame.shape
@@ -125,6 +126,11 @@ class SemanticMatchingModel(nn.Module):
         # interactions between the relations and the terms. k_1 is the
         # dimensionality of the term embeddings, and k_2 is the dimensionality
         # of the relation embeddings.
+        #
+        # We pass the dimensions in the order (k_1, k_1, k_2) because the
+        # PyTorch convention is that inputs come before outputs, but the
+        # resulting tensor is (k_2 x k_1 x k_1) because the math convention
+        # is that outputs are on the left.
         self.assoc_tensor = nn.Bilinear(
             self.term_dim, self.term_dim, self.relation_dim, bias=True
         )
@@ -146,6 +152,8 @@ class SemanticMatchingModel(nn.Module):
 
         # Learnable priors for how confident to be in arbitrary statements.
         # These are used to convert the tensor products linearly into logits.
+        # The initial values of these are set to numbers that appeared
+        # reasonable based on a previous run.
         self.truth_multiplier = nn.Parameter(self.float_type([5.]))
         self.truth_offset = nn.Parameter(self.float_type([-3.]))
 
@@ -369,7 +377,16 @@ class SemanticMatchingModel(nn.Module):
         to `sme/sme.model` every 5000 iterations, and you can run it for as
         long as you want.
         """
+        # Relative loss says that the positive examples should outrank their
+        # corresponding negative examples, with a difference of at least 1
+        # logit between them. If the difference is less than this (especially
+        # if it's negative), this adds to the relative loss.
         relative_loss_function = nn.MarginRankingLoss(margin=1)
+
+        # Absolute loss measures the cross-entropy of the predictions:
+        # true statements should get positive values, false statements should
+        # get negative values, and the sigmoid of those values should be a
+        # probability that accurately reflects the model's confidence.
         absolute_loss_function = nn.BCEWithLogitsLoss()
 
         optimizer = optim.SGD(self.parameters(), lr=0.1, weight_decay=1e-9)
