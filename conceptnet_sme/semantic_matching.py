@@ -9,7 +9,7 @@ import random
 import pathlib
 import os
 
-from general_relativity.relations import (
+from conceptnet_sme.relations import (
     COMMON_RELATIONS, ALL_RELATIONS, SYMMETRIC_RELATIONS, ENTAILED_RELATIONS,
 )
 from conceptnet5.uri import uri_prefix, assertion_uri

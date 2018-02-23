@@ -2,15 +2,15 @@ from setuptools import setup
 
 
 setup(
-    name="general-relativity",
+    name="conceptnet-sme",
     version='0.1',
     maintainer='Luminoso Technologies, Inc.',
     maintainer_email='rspeer@luminoso.com',
-    license="Proprietary",
-    url='http://github.com/LuminosoInsight/general-relativity',
+    license="Apache License 2.0",
+    url='http://github.com/LuminosoInsight/conceptnet-sme',
     platforms=["any"],
     description="Models relations between terms in general knowledge",
-    packages=['general_relativity'],
+    packages=['conceptnet_sme'],
     install_requires=['numpy', 'conceptnet'],
     # also requires pytorch but pytorch doesn't install with pip
     zip_safe=False,
