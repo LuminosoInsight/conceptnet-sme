@@ -11,12 +11,9 @@ import os
 
 from general_relativity.relations import (
     COMMON_RELATIONS, ALL_RELATIONS, SYMMETRIC_RELATIONS, ENTAILED_RELATIONS,
-    reverse_relation
 )
-from conceptnet5.languages import CORE_LANGUAGES
-from conceptnet5.vectors.debias import GENDERED_WORDS, GENDER_NEUTRAL_WORDS, MALE_WORDS, FEMALE_WORDS
 from conceptnet5.uri import uri_prefix, assertion_uri
-from conceptnet5.nodes import standardized_concept_uri, get_uri_language
+from conceptnet5.nodes import get_uri_language
 from conceptnet5.util import get_data_filename
 from conceptnet5.vectors.formats import load_hdf
 from conceptnet5.vectors.transforms import l2_normalize_rows
@@ -374,7 +371,6 @@ class SemanticMatchingModel(nn.Module):
         """
         relative_loss_function = nn.MarginRankingLoss(margin=1)
         absolute_loss_function = nn.BCEWithLogitsLoss()
-        one_side_loss_function = nn.MarginRankingLoss(margin=0)
 
         optimizer = optim.SGD(self.parameters(), lr=0.1, weight_decay=1e-9)
         losses = []
