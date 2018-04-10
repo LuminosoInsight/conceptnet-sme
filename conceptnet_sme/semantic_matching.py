@@ -360,8 +360,6 @@ class SemanticMatchingModel(nn.Module):
 
         if use_cuda and torch.cuda.is_available():
             self.cuda()
-            if torch.cuda.device_count() > 1:
-                self = nn.DataParallel(self)
 
     def reset_synonym_relation(self):
         """
@@ -449,6 +447,8 @@ class SemanticMatchingModel(nn.Module):
         frame = SemanticMatchingModel.load_initial_frame()
         model = SemanticMatchingModel(l2_normalize_rows(frame))
         model.load_state_dict(torch.load(filename))
+        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
         return model
 
     def ltvar(self, numbers):
@@ -601,6 +601,8 @@ def get_model():
     else:
         frame = SemanticMatchingModel.load_initial_frame()
         model = SemanticMatchingModel(l2_normalize_rows(frame))
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
     return model
 
 
