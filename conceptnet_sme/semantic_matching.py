@@ -447,8 +447,6 @@ class SemanticMatchingModel(nn.Module):
         frame = SemanticMatchingModel.load_initial_frame()
         model = SemanticMatchingModel(l2_normalize_rows(frame))
         model.load_state_dict(torch.load(filename))
-        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-            model = nn.DataParallel(model)
         return model
 
     def ltvar(self, numbers):
@@ -464,6 +462,13 @@ class SemanticMatchingModel(nn.Module):
         We particularly highlight edges that get a value of -1 or less, which
         may be bad or unhelpful edges.
         """
+        self.eval() # in case someday we add submodules where the mode matters
+        if self.int_type == torch.cuda.LongTensor \
+           and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            parallel_model = nn.DataParallel(self)
+        else:
+            parallel_model = self
+            
         if output_filename:
             out = open(output_filename, 'w', encoding='utf-8')
         else:
@@ -476,9 +481,10 @@ class SemanticMatchingModel(nn.Module):
             except KeyError:
                 continue
 
-            model_output = self(self.ltvar([rel_idx]),
-                                self.ltvar([left_idx]),
-                                self.ltvar([right_idx]))
+            model_output = parallel_model(
+                self.ltvar([rel_idx]),
+                self.ltvar([left_idx]),
+                self.ltvar([right_idx]))
             value = model_output.data[0]
             assertion = assertion_uri(rel, left, right)
             if value < cutoff_value:
@@ -527,6 +533,13 @@ def train_model(model):
     to `sme/sme.model` every 5000 iterations, and you can run it for as
     long as you want.
     """
+    model.train()
+    if model.int_type == torch.cuda.LongTensor \
+       and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        parallel_model = nn.DataParallel(model)
+    else:
+        parallel_model = model
+        
     # Relative loss says that the positive examples should outrank their
     # corresponding negative examples, with a difference of at least 1
     # logit between them. If the difference is less than this (especially
@@ -539,7 +552,7 @@ def train_model(model):
     # probability that accurately reflects the model's confidence.
     absolute_loss_function = nn.BCEWithLogitsLoss()
 
-    optimizer = optim.SGD(model.parameters(), lr=0.1, weight_decay=1e-9)
+    optimizer = optim.SGD(parallel_model.parameters(), lr=0.1, weight_decay=1e-9)
     losses = []
     steps = 0
 
@@ -555,9 +568,9 @@ def train_model(model):
             neg_batch = tuple(x.cuda(async=True) for x in neg_batch)
         if model.float_type == torch.cuda.FloatTensor:
             weights = weights.cuda(async=True)
-        model.zero_grad()
-        pos_energy = model(*pos_batch)
-        neg_energy = model(*neg_batch)
+        parallel_model.zero_grad()
+        pos_energy = parallel_model(*pos_batch)
+        neg_energy = parallel_model(*neg_batch)
         
         true_target = torch.ones_like(pos_energy)
         
@@ -572,7 +585,7 @@ def train_model(model):
         loss = abs_loss + rel_loss
         loss.backward()
 
-        nn.utils.clip_grad_norm(model.parameters(), 1)
+        nn.utils.clip_grad_norm(parallel_model.parameters(), 1)
         optimizer.step()
         model.reset_synonym_relation()
 
@@ -588,7 +601,7 @@ def train_model(model):
             ))
             losses.clear()
         if steps % 5000 == 0:
-            torch.save(model.state_dict(), MODEL_FILENAME)
+            torch.save(parallel_model.state_dict(), MODEL_FILENAME)
             print("saved")
     print()
 
@@ -604,8 +617,6 @@ def get_model():
     else:
         frame = SemanticMatchingModel.load_initial_frame()
         model = SemanticMatchingModel(l2_normalize_rows(frame))
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
     return model
 
 
