@@ -486,78 +486,6 @@ class SemanticMatchingModel(nn.Module):
             if out is not None:
                 print("%4.4f\t%s" % (value, assertion), file=out)
 
-    def train(self):
-        """
-        Incrementally train the model.
-
-        As it is, this method will never return. It writes the results so far
-        to `sme/sme.model` every 5000 iterations, and you can run it for as
-        long as you want.
-        """
-        # Relative loss says that the positive examples should outrank their
-        # corresponding negative examples, with a difference of at least 1
-        # logit between them. If the difference is less than this (especially
-        # if it's negative), this adds to the relative loss.
-        relative_loss_function = nn.MarginRankingLoss(margin=1)
-
-        # Absolute loss measures the cross-entropy of the predictions:
-        # true statements should get positive values, false statements should
-        # get negative values, and the sigmoid of those values should be a
-        # probability that accurately reflects the model's confidence.
-        absolute_loss_function = nn.BCEWithLogitsLoss()
-
-        optimizer = optim.SGD(self.parameters(), lr=0.1, weight_decay=1e-9)
-        losses = []
-        true_target = autograd.Variable(self.float_type([1] * self.batch_size))
-        false_target = autograd.Variable(self.float_type([0] * self.batch_size))
-        steps = 0
-
-        # Note that you want drop_last=False with a CyclingSampler.
-        data_loader = DataLoader(self.dataset, batch_size=self.batch_size,
-                                 drop_last=False, num_workers=10,
-                                 collate_fn=self.dataset.collate_batch,
-                                 sampler=CyclingSampler(self.dataset),
-                                 pin_memory=True)
-        for pos_batch, neg_batch, weights in data_loader:
-            if self.int_type == torch.cuda.LongTensor:
-                pos_batch = tuple(x.cuda(async=True) for x in pos_batch)
-                neg_batch = tuple(x.cuda(async=True) for x in neg_batch)
-            if self.float_type == torch.cuda.FloatTensor:
-                weights = weights.cuda(async=True)
-            self.zero_grad()
-            pos_energy = self(*pos_batch)
-            neg_energy = self(*neg_batch)
-
-            abs_loss = absolute_loss_function(pos_energy, true_target)
-            rel_loss = 0
-            for neg_index in range(NEG_SAMPLES):
-                neg_energy_slice = neg_energy[neg_index::NEG_SAMPLES]
-                rel_loss += relative_loss_function(pos_energy, neg_energy_slice, true_target)
-                abs_loss += absolute_loss_function(neg_energy_slice, false_target)
-
-            loss = abs_loss + rel_loss
-            loss.backward()
-
-            nn.utils.clip_grad_norm(self.parameters(), 1)
-            optimizer.step()
-            self.reset_synonym_relation()
-
-            losses.append(loss.data[0])
-            steps += 1
-            
-            if steps in (1, 10, 20, 50, 100) or steps % 100 == 0:
-                self.show_debug(neg_batch, neg_energy, False)
-                self.show_debug(pos_batch, pos_energy, True)
-                avg_loss = np.mean(losses)
-                print("%d steps, loss=%4.4f, abs=%4.4f, rel=%4.4f" % (
-                    steps, avg_loss, abs_loss, rel_loss
-                ))
-                losses.clear()
-            if steps % 5000 == 0:
-                torch.save(self.state_dict(), MODEL_FILENAME)
-                print("saved")
-        print()
-
     def export(self, dirname):
         """
         Convert the model into HDF5 / NumPy files that can be loaded from
@@ -591,6 +519,81 @@ class SemanticMatchingModel(nn.Module):
         save_hdf(related_terms, str(path / "terms-related.h5"))
 
 
+def train_model(model):
+    """
+    Incrementally train the model.
+
+    As it is, this function will never return. It writes the results so far
+    to `sme/sme.model` every 5000 iterations, and you can run it for as
+    long as you want.
+    """
+    # Relative loss says that the positive examples should outrank their
+    # corresponding negative examples, with a difference of at least 1
+    # logit between them. If the difference is less than this (especially
+    # if it's negative), this adds to the relative loss.
+    relative_loss_function = nn.MarginRankingLoss(margin=1)
+
+    # Absolute loss measures the cross-entropy of the predictions:
+    # true statements should get positive values, false statements should
+    # get negative values, and the sigmoid of those values should be a
+    # probability that accurately reflects the model's confidence.
+    absolute_loss_function = nn.BCEWithLogitsLoss()
+
+    optimizer = optim.SGD(model.parameters(), lr=0.1, weight_decay=1e-9)
+    losses = []
+    steps = 0
+
+    # Note that you want drop_last=False with a CyclingSampler.
+    data_loader = DataLoader(model.dataset, batch_size=model.batch_size,
+                             drop_last=False, num_workers=10,
+                             collate_fn=model.dataset.collate_batch,
+                             sampler=CyclingSampler(model.dataset),
+                             pin_memory=True)
+    for pos_batch, neg_batch, weights in data_loader:
+        if model.int_type == torch.cuda.LongTensor:
+            pos_batch = tuple(x.cuda(async=True) for x in pos_batch)
+            neg_batch = tuple(x.cuda(async=True) for x in neg_batch)
+        if model.float_type == torch.cuda.FloatTensor:
+            weights = weights.cuda(async=True)
+        model.zero_grad()
+        pos_energy = model(*pos_batch)
+        neg_energy = model(*neg_batch)
+        
+        true_target = torch.ones_like(pos_energy)
+        
+        abs_loss = absolute_loss_function(pos_energy, true_target)
+        rel_loss = 0
+        for neg_index in range(NEG_SAMPLES):
+            neg_energy_slice = neg_energy[neg_index::NEG_SAMPLES]
+            false_target = torch.zeros_like(neg_energy_slice)
+            rel_loss += relative_loss_function(pos_energy, neg_energy_slice, true_target)
+            abs_loss += absolute_loss_function(neg_energy_slice, false_target)
+
+        loss = abs_loss + rel_loss
+        loss.backward()
+
+        nn.utils.clip_grad_norm(model.parameters(), 1)
+        optimizer.step()
+        model.reset_synonym_relation()
+
+        losses.append(loss.data[0])
+        steps += 1
+
+        if steps in (1, 10, 20, 50, 100) or steps % 100 == 0:
+            model.show_debug(neg_batch, neg_energy, False)
+            model.show_debug(pos_batch, pos_energy, True)
+            avg_loss = np.mean(losses)
+            print("%d steps, loss=%4.4f, abs=%4.4f, rel=%4.4f" % (
+                steps, avg_loss, abs_loss, rel_loss
+            ))
+            losses.clear()
+        if steps % 5000 == 0:
+            torch.save(model.state_dict(), MODEL_FILENAME)
+            print("saved")
+    print()
+
+
+
 def get_model():
     """
     Instantiate a model, either by loading it from the saved checkpoint, or
@@ -608,5 +611,5 @@ def get_model():
 
 if __name__ == '__main__':
     model = get_model()
-    model.train()
+    train_model(model)
     # model.evaluate_conceptnet()
