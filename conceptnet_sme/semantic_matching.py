@@ -554,6 +554,8 @@ def train_model(model):
 
     optimizer = optim.SGD(parallel_model.parameters(), lr=0.1, weight_decay=1e-9)
     losses = []
+    true_target = autograd.Variable(model.float_type([1] * model.batch_size))
+    false_target = autograd.Variable(model.float_type([0] * model.batch_size))
     steps = 0
 
     # Note that you want drop_last=False with a CyclingSampler.
@@ -572,13 +574,10 @@ def train_model(model):
         pos_energy = parallel_model(*pos_batch)
         neg_energy = parallel_model(*neg_batch)
         
-        true_target = torch.ones_like(pos_energy)
-        
         abs_loss = absolute_loss_function(pos_energy, true_target)
         rel_loss = 0
         for neg_index in range(NEG_SAMPLES):
             neg_energy_slice = neg_energy[neg_index::NEG_SAMPLES]
-            false_target = torch.zeros_like(neg_energy_slice)
             rel_loss += relative_loss_function(pos_energy, neg_energy_slice, true_target)
             abs_loss += absolute_loss_function(neg_energy_slice, false_target)
 
