@@ -463,11 +463,6 @@ class SemanticMatchingModel(nn.Module):
         may be bad or unhelpful edges.
         """
         self.eval() # in case someday we add submodules where the mode matters
-        if self.int_type == torch.cuda.LongTensor \
-           and torch.cuda.is_available() and torch.cuda.device_count() > 1:
-            parallel_model = nn.DataParallel(self)
-        else:
-            parallel_model = self
             
         if output_filename:
             out = open(output_filename, 'w', encoding='utf-8')
@@ -481,10 +476,9 @@ class SemanticMatchingModel(nn.Module):
             except KeyError:
                 continue
 
-            model_output = parallel_model(
-                self.ltvar([rel_idx]),
-                self.ltvar([left_idx]),
-                self.ltvar([right_idx]))
+            model_output = self(self.ltvar([rel_idx]),
+                                self.ltvar([left_idx]),
+                                self.ltvar([right_idx]))
             value = model_output.data[0]
             assertion = assertion_uri(rel, left, right)
             if value < cutoff_value:
@@ -600,7 +594,7 @@ def train_model(model):
             ))
             losses.clear()
         if steps % 5000 == 0:
-            torch.save(parallel_model.state_dict(), MODEL_FILENAME)
+            torch.save(model.state_dict(), MODEL_FILENAME)
             print("saved")
     print()
 
