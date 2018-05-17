@@ -28,7 +28,7 @@ from conceptnet5.vectors.transforms import l2_normalize_rows
 
 RELATION_INDEX = pd.Index(COMMON_RELATIONS)
 N_RELS = len(RELATION_INDEX)
-INITIAL_VECS_FILENAME = get_data_filename('vectors/numberbatch-biased.h5')
+INITIAL_VECS_FILENAME = get_data_filename('vectors/numberbatch-propagated.h5')
 EDGES_FILENAME = get_data_filename('collated/sorted/edges-shuf.csv')
 MODEL_FILENAME = get_data_filename('sme/sme.model')
 NEG_SAMPLES = 5
@@ -228,13 +228,13 @@ class EdgeDataset(Dataset):
             neg_left.append(corrupt_left_idx)
             neg_right.append(corrupt_right_idx)
 
-        pos_data = dict(rel=autograd.Variable(torch.LongTensor(pos_rels)),
-                        left=autograd.Variable(torch.LongTensor(pos_left)),
-                        right=autograd.Variable(torch.LongTensor(pos_right)))
-        neg_data = dict(rel=autograd.Variable(torch.LongTensor(neg_rels)),
-                        left=autograd.Variable(torch.LongTensor(neg_left)),
-                        right=autograd.Variable(torch.LongTensor(neg_right)))
-        weights = autograd.Variable(torch.FloatTensor(weights))
+        pos_data = dict(rel=torch.LongTensor(pos_rels),
+                        left=torch.LongTensor(pos_left),
+                        right=torch.LongTensor(pos_right))
+        neg_data = dict(rel=torch.LongTensor(neg_rels),
+                        left=torch.LongTensor(neg_left),
+                        right=torch.LongTensor(neg_right))
+        weights = torch.FloatTensor(weights)
         return dict(positive_data=pos_data,
                     negative_data=neg_data,
                     weights=weights)
@@ -306,7 +306,8 @@ class SemanticMatchingModel(nn.Module):
         # Initialize term embeddings, including the index that converts terms
         # from strings to row numbers
         self.index = frame.index
-        self.term_vecs = nn.Embedding(frame.shape[0], self.term_dim)
+        self.term_vecs = nn.Embedding(frame.shape[0], self.term_dim,
+                                      sparse=True)
         self.term_vecs.weight.data.copy_(
             torch.from_numpy(frame.values)
         )
@@ -323,7 +324,7 @@ class SemanticMatchingModel(nn.Module):
         self.assoc_tensor = nn.Bilinear(
             self.term_dim, self.term_dim, self.relation_dim, bias=True
         )
-        self.rel_vecs = nn.Embedding(N_RELS, self.relation_dim)
+        self.rel_vecs = nn.Embedding(N_RELS, self.relation_dim, sparse=True)
 
         # Using CUDA to run on the GPU requires different data types
         if use_cuda and torch.cuda.is_available():
@@ -446,7 +447,14 @@ class SemanticMatchingModel(nn.Module):
         """
         frame = SemanticMatchingModel.load_initial_frame()
         model = SemanticMatchingModel(l2_normalize_rows(frame))
+        # We have adopted the convention that models are moved to the
+        # cpu before saving their state (as else loading would need
+        # twice the gpu memory).  We (currently) do not support building
+        # a model on the gpu and loading it on the cpu (or conversely).
+        model.cpu()
         model.load_state_dict(torch.load(filename))
+        if model.float_type == torch.cuda.FloatTensor:
+            model.cuda()
         return model
 
     def ltvar(self, numbers):
@@ -519,6 +527,184 @@ class SemanticMatchingModel(nn.Module):
         save_hdf(related_terms, str(path / "terms-related.h5"))
 
 
+
+def clip_grad_norm(parameters, max_norm, norm_type=2):
+    r"""Clips gradient norm of an iterable of parameters, just like 
+    nn.utils.clip_grad_norm, but works even if some parameters are sparse.
+
+    The norm is computed over all gradients together, as if they were
+    concatenated into a single vector. Gradients are modified in-place.
+
+    Arguments:
+        parameters (Iterable[Variable]): an iterable of Variables that will have
+            gradients normalized
+        max_norm (float or int): max norm of the gradients
+        norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
+            infinity norm.
+
+    Returns:
+        Total norm of the parameters (viewed as a single vector).
+    """
+    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    max_norm = float(max_norm)
+    norm_type = float(norm_type)
+    sparse_tensor_types = (torch.cuda.sparse.FloatTensor,
+                           torch.cuda.sparse.DoubleTensor,
+                           torch.sparse.FloatTensor,
+                           torch.sparse.DoubleTensor)
+    if norm_type == float('inf'):
+        def L_inf_norm(tensor):
+            if isinstance(tensor, sparse_tensor_types):
+                if tensor._nnz() > 0:
+                    return tensor.coalesce()._values().abs().max()
+                else:
+                    return 0.0
+            else:
+                return tensor.abs().max()
+        total_norm = max(L_inf_norm(p.grad.data) for p in parameters)
+    else:
+        total_norm = 0
+        for p in parameters:
+            if isinstance(p.grad.data, sparse_tensor_types):
+                param_norm = p.grad.data.coalesce()._values().norm(norm_type)
+            else:
+                param_norm = p.grad.data.norm(norm_type)
+            total_norm += param_norm ** norm_type
+        total_norm = total_norm ** (1. / norm_type)
+    clip_coef = max_norm / (total_norm + 1e-6)
+    if clip_coef < 1:
+        for p in parameters:
+            p.grad.data.mul_(clip_coef)
+    return total_norm
+
+
+
+class SGD_Sparse(optim.SGD):
+    """
+    Just like optim.SGD except that this class handles non-zero 
+    weight decay and momentum even when some of the parameters 
+    being optimized have sparse gradient storage.
+    
+    NOTE:  Currently there seem to be gpu memory leaks when using 
+    Nesterov momentum; use that at your own risk.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        return
+
+    def step(self, closure=None):
+        """Performs a single optimization step.
+
+        Arguments:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            weight_decay = group['weight_decay']
+            momentum = group['momentum']
+            dampening = group['dampening']
+            nesterov = group['nesterov']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                d_p = p.grad.data
+                d_p_is_sparse = isinstance(
+                    d_p, (torch.cuda.sparse.FloatTensor,
+                          torch.cuda.sparse.DoubleTensor,
+                          torch.sparse.FloatTensor,
+                          torch.sparse.DoubleTensor))
+                if weight_decay != 0:
+                    if not d_p_is_sparse:
+                        d_p.add_(weight_decay, p.data)
+                    else:
+                        # Update the gradient via weight decay only at
+                        # locations where it is already non-zero; this
+                        # isn't quite the same as actual weight decay but
+                        # it avoids ballooning the memory consumption.
+                        d_p = d_p.coalesce()
+                        p.grad.data = d_p
+                        if len(d_p._indices().size()) < 2: # empty sparse tensor
+                            pass
+                        else:
+                            ctor = type(d_p)
+                            index_ctor = torch.cuda.LongTensor if d_p.is_cuda \
+                                         else torch.LongTensor
+                            # Find the indices of the nonzero entries in the
+                            # gradient, assuming row-major storage order, by
+                            # finding the index of each nonzero subtensor's
+                            # first entry and adding offsets to the other
+                            # entries.
+                            assert p.data.size() == d_p.size()
+                            n_sparse_dims, n_values = d_p._indices().size()
+                            values_shape = tuple(d_p._values().size())
+                            assert len(values_shape) > 0
+                            assert n_values == values_shape[0]
+                            value_size = np.prod(np.array(values_shape[1:]))
+                            factors = np.array(d_p.size())
+                            factors = np.flip(factors, axis=0)
+                            factors = np.append(np.array([1]), factors[:-1])
+                            factors = np.cumprod(factors)
+                            factors = np.flip(factors, axis=0)
+                            factors = factors.tolist() # lose negative strides
+                            assert n_sparse_dims <= len(factors)
+                            flat_indices0 = index_ctor(np.zeros(
+                                shape=(n_values,), dtype=np.int64))
+                            for i_sparse_dim in range(n_sparse_dims):
+                                flat_indices0.add_(
+                                    factors[i_sparse_dim],
+                                    d_p._indices()[i_sparse_dim])
+                            flat_indices0.unsqueeze_(1)
+                            offsets = index_ctor(np.arange(
+                                value_size, dtype=np.int64)).unsqueeze(0)
+                            flat_indices = \
+                                torch.index_select(
+                                    flat_indices0, 1,
+                                    index_ctor(np.zeros((value_size,),
+                                                        dtype=np.int64))) \
+                                + \
+                                torch.index_select(
+                                    offsets, 0,
+                                    index_ctor(np.zeros((n_values,),
+                                                        dtype=np.int64)))
+                            flat_indices.resize_(values_shape)
+                            del flat_indices0, offsets
+                            sparse_data = ctor(
+                                d_p._indices(),
+                                torch.take(p.data, flat_indices),
+                                d_p.size()
+                            )
+                            d_p.add_(weight_decay, sparse_data)
+                            del flat_indices, sparse_data
+                if momentum != 0:
+                    param_state = self.state[p]
+                    if 'momentum_buffer' not in param_state:
+                        buf = param_state['momentum_buffer'] = torch.zeros_like(d_p)
+                        buf.mul_(momentum).add_(d_p)
+                    else:
+                        buf = param_state['momentum_buffer']
+                        buf.mul_(momentum).add_(1 - dampening, d_p)
+                    if d_p_is_sparse:
+                        buf = buf.coalesce()
+                        param_state['momentum_buffer'] = buf
+                    if nesterov:
+                        d_p = d_p.add(momentum, buf)
+                    else:
+                        d_p = buf
+                if d_p_is_sparse:
+                    d_p = d_p.coalesce()
+                    p.grad.data = d_p
+
+                p.data.add_(-group['lr'], d_p)
+
+        return loss
+
+
+
 def train_model(model):
     """
     Incrementally train the model.
@@ -546,7 +732,8 @@ def train_model(model):
     # probability that accurately reflects the model's confidence.
     absolute_loss_function = nn.BCEWithLogitsLoss()
 
-    optimizer = optim.SGD(parallel_model.parameters(), lr=0.1, weight_decay=1e-9)
+    optimizer = SGD_Sparse(parallel_model.parameters(), lr=0.1,
+                           weight_decay=1e-9)
     losses = []
     true_target = autograd.Variable(model.float_type([1] * model.batch_size))
     false_target = autograd.Variable(model.float_type([0] * model.batch_size))
@@ -564,6 +751,8 @@ def train_model(model):
             neg_batch = tuple(x.cuda(async=True) for x in neg_batch)
         if model.float_type == torch.cuda.FloatTensor:
             weights = weights.cuda(async=True)
+        pos_batch = tuple(autograd.Variable(x) for x in pos_batch)
+        neg_batch = tuple(autograd.Variable(x) for x in neg_batch)
         parallel_model.zero_grad()
         pos_energy = parallel_model(*pos_batch)
         neg_energy = parallel_model(*neg_batch)
@@ -578,11 +767,11 @@ def train_model(model):
         loss = abs_loss + rel_loss
         loss.backward()
 
-        nn.utils.clip_grad_norm(parallel_model.parameters(), 1)
+        clip_grad_norm(parallel_model.parameters(), 1)
         optimizer.step()
         model.reset_synonym_relation()
 
-        losses.append(loss.data[0])
+        losses.append(loss.data.cpu()[0])
         steps += 1
 
         if steps in (1, 10, 20, 50, 100) or steps % 100 == 0:
@@ -594,7 +783,10 @@ def train_model(model):
             ))
             losses.clear()
         if steps % 5000 == 0:
+            model.cpu()
             torch.save(model.state_dict(), MODEL_FILENAME)
+            if model.float_type == torch.cuda.FloatTensor:
+                model.cuda()
             print("saved")
     print()
 
