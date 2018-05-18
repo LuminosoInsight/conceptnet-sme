@@ -28,7 +28,7 @@ from conceptnet5.vectors.transforms import l2_normalize_rows
 
 RELATION_INDEX = pd.Index(COMMON_RELATIONS)
 N_RELS = len(RELATION_INDEX)
-INITIAL_VECS_FILENAME = get_data_filename('vectors/numberbatch-propagated.h5')
+INITIAL_VECS_FILENAME = get_data_filename('vectors/numberbatch-biased.h5')
 EDGES_FILENAME = get_data_filename('collated/sorted/edges-shuf.csv')
 MODEL_FILENAME = get_data_filename('sme/sme.model')
 NEG_SAMPLES = 5
