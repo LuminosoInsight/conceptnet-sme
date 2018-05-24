@@ -177,7 +177,7 @@ class EdgeDataset(Dataset):
         '''
         Produce a positive example and weight and a batch of (of size 
         NEG_SAMPLES) of negative examples, derived from the edge at the 
-        given index.  The return values are three torch variables containing 
+        given index.  The return values are three torch tensors containing 
         the positive example, the negative examples, and the weights.
         '''
         rel_idx = self.rel_indices[i_edge]
@@ -281,7 +281,7 @@ class SemanticMatchingModel(nn.Module):
     """
     The PyTorch model for semantic matching energy over ConceptNet.
     """
-    def __init__(self, frame, use_cuda=True, relation_dim=10, batch_size=4096):
+    def __init__(self, frame, use_cuda=True, relation_dim=10, batch_size=128):
         """
         Parameters:
 
@@ -328,14 +328,9 @@ class SemanticMatchingModel(nn.Module):
 
         # Using CUDA to run on the GPU requires different data types
         if use_cuda and torch.cuda.is_available():
-            self.float_type = torch.cuda.FloatTensor
-            self.int_type = torch.cuda.LongTensor
-            self.term_vecs = self.term_vecs.cuda()
-            self.rel_vecs = self.rel_vecs.cuda()
-            self.assoc_tensor = self.assoc_tensor.cuda()
+            self.device = torch.device('cuda')
         else:
-            self.float_type = torch.FloatTensor
-            self.int_type = torch.LongTensor
+            self.device = torch.device('cpu')
 
         print('Initializing edge dataset ....')
         dataset_accumulator = TimeAccumulator()
@@ -349,18 +344,21 @@ class SemanticMatchingModel(nn.Module):
         dataset_accumulator.print('Edge dataset initialization took')
         print('Edge dataset contains {} edges.'.format(len(self.dataset)))
 
-        self.identity_slice = self.float_type(np.eye(self.term_dim))
+        self.identity_slice = torch.tensor(np.eye(self.term_dim),
+                                           dtype=torch.float32,
+                                           device=self.device)
         self.reset_synonym_relation()
 
         # Learnable priors for how confident to be in arbitrary statements.
         # These are used to convert the tensor products linearly into logits.
         # The initial values of these are set to numbers that appeared
         # reasonable based on a previous run.
-        self.truth_multiplier = nn.Parameter(self.float_type([5.]))
-        self.truth_offset = nn.Parameter(self.float_type([-3.]))
+        self.truth_multiplier = nn.Parameter(torch.tensor(
+            5.0, dtype=torch.float32, device=self.device))
+        self.truth_offset = nn.Parameter(torch.tensor(
+            -3.0, dtype=torch.float32, device=self.device))
 
-        if use_cuda and torch.cuda.is_available():
-            self.cuda()
+        self.to(self.device) # make sure everything is on the right device
 
     def reset_synonym_relation(self):
         """
@@ -453,16 +451,8 @@ class SemanticMatchingModel(nn.Module):
         # a model on the gpu and loading it on the cpu (or conversely).
         model.cpu()
         model.load_state_dict(torch.load(filename))
-        if model.float_type == torch.cuda.FloatTensor:
-            model.cuda()
+        model.to(model.device)
         return model
-
-    def ltvar(self, numbers):
-        """
-        This is something we have to do a lot: take a list or a numpy array
-        of integers, and turn it into a Variable containing a LongTensor.
-        """
-        return autograd.Variable(self.int_type(numbers))
 
     def evaluate_conceptnet(self, cutoff_value=-1, output_filename=None):
         """
@@ -484,10 +474,16 @@ class SemanticMatchingModel(nn.Module):
             except KeyError:
                 continue
 
-            model_output = self(self.ltvar([rel_idx]),
-                                self.ltvar([left_idx]),
-                                self.ltvar([right_idx]))
-            value = model_output.data[0]
+            rel_tensor = torch.tensor([rel_idx], dtype=torch.int64,
+                                      device=self.device)
+            left_tensor = torch.tensor([left_idx], dtype=torch.int64,
+                                       device=self.device)
+            right_tensor = torch.tensor([right_idx], dtype=torch.int64,
+                                        device=self.device)
+
+            model_output = self(rel_tensor, left_tensor, right_tensor)
+ 
+            value = model_output.item()
             assertion = assertion_uri(rel, left, right)
             if value < cutoff_value:
                 print("%4.4f\t%s" % (value, assertion))
@@ -530,13 +526,13 @@ class SemanticMatchingModel(nn.Module):
 
 def clip_grad_norm(parameters, max_norm, norm_type=2):
     r"""Clips gradient norm of an iterable of parameters, just like 
-    nn.utils.clip_grad_norm, but works even if some parameters are sparse.
+    nn.utils.clip_grad_norm_, but works even if some parameters are sparse.
 
     The norm is computed over all gradients together, as if they were
     concatenated into a single vector. Gradients are modified in-place.
 
     Arguments:
-        parameters (Iterable[Variable]): an iterable of Variables that will have
+        parameters (Iterable[Tensor]): an iterable of Tensors that will have
             gradients normalized
         max_norm (float or int): max norm of the gradients
         norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
@@ -548,13 +544,9 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
     parameters = list(filter(lambda p: p.grad is not None, parameters))
     max_norm = float(max_norm)
     norm_type = float(norm_type)
-    sparse_tensor_types = (torch.cuda.sparse.FloatTensor,
-                           torch.cuda.sparse.DoubleTensor,
-                           torch.sparse.FloatTensor,
-                           torch.sparse.DoubleTensor)
     if norm_type == float('inf'):
         def L_inf_norm(tensor):
-            if isinstance(tensor, sparse_tensor_types):
+            if tensor.layout == torch.sparse_coo:
                 if tensor._nnz() > 0:
                     return tensor.coalesce()._values().abs().max()
                 else:
@@ -565,13 +557,13 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
     else:
         total_norm = 0
         for p in parameters:
-            if isinstance(p.grad.data, sparse_tensor_types):
+            if p.grad.data.layout == torch.sparse_coo:
                 param_norm = p.grad.data.coalesce()._values().norm(norm_type)
             else:
                 param_norm = p.grad.data.norm(norm_type)
             total_norm += param_norm ** norm_type
         total_norm = total_norm ** (1. / norm_type)
-    clip_coef = max_norm / (total_norm + 1e-6)
+    clip_coef = float(max_norm / (total_norm + 1e-6))
     if clip_coef < 1:
         for p in parameters:
             p.grad.data.mul_(clip_coef)
@@ -588,10 +580,6 @@ class SGD_Sparse(optim.SGD):
     NOTE:  Currently there seem to be gpu memory leaks when using 
     Nesterov momentum; use that at your own risk.
     """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        return
-
     def step(self, closure=None):
         """Performs a single optimization step.
 
@@ -613,11 +601,7 @@ class SGD_Sparse(optim.SGD):
                 if p.grad is None:
                     continue
                 d_p = p.grad.data
-                d_p_is_sparse = isinstance(
-                    d_p, (torch.cuda.sparse.FloatTensor,
-                          torch.cuda.sparse.DoubleTensor,
-                          torch.sparse.FloatTensor,
-                          torch.sparse.DoubleTensor))
+                d_p_is_sparse = (d_p.layout == torch.sparse_coo)
                 if weight_decay != 0:
                     if not d_p_is_sparse:
                         d_p.add_(weight_decay, p.data)
@@ -631,7 +615,7 @@ class SGD_Sparse(optim.SGD):
                         if len(d_p._indices().size()) < 2: # empty sparse tensor
                             pass
                         else:
-                            ctor = type(d_p)
+                            ctor = eval(d_p.type())
                             index_ctor = torch.cuda.LongTensor if d_p.is_cuda \
                                          else torch.LongTensor
                             # Find the indices of the nonzero entries in the
@@ -714,7 +698,7 @@ def train_model(model):
     long as you want.
     """
     model.train()
-    if model.int_type == torch.cuda.LongTensor \
+    if model.device != torch.device('cpu') \
        and torch.cuda.is_available() and torch.cuda.device_count() > 1:
         parallel_model = nn.DataParallel(model)
     else:
@@ -735,8 +719,10 @@ def train_model(model):
     optimizer = SGD_Sparse(parallel_model.parameters(), lr=0.1,
                            weight_decay=1e-9)
     losses = []
-    true_target = autograd.Variable(model.float_type([1] * model.batch_size))
-    false_target = autograd.Variable(model.float_type([0] * model.batch_size))
+    true_target = torch.ones([model.batch_size], dtype=torch.float32,
+                             device=model.device)
+    false_target = torch.zeros([model.batch_size], dtype=torch.float32,
+                               device=model.device)
     steps = 0
 
     # Note that you want drop_last=False with a CyclingSampler.
@@ -746,13 +732,10 @@ def train_model(model):
                              sampler=CyclingSampler(model.dataset),
                              pin_memory=True)
     for pos_batch, neg_batch, weights in data_loader:
-        if model.int_type == torch.cuda.LongTensor:
+        if model.device != torch.device('cpu'):
             pos_batch = tuple(x.cuda(async=True) for x in pos_batch)
             neg_batch = tuple(x.cuda(async=True) for x in neg_batch)
-        if model.float_type == torch.cuda.FloatTensor:
             weights = weights.cuda(async=True)
-        pos_batch = tuple(autograd.Variable(x) for x in pos_batch)
-        neg_batch = tuple(autograd.Variable(x) for x in neg_batch)
         parallel_model.zero_grad()
         pos_energy = parallel_model(*pos_batch)
         neg_energy = parallel_model(*neg_batch)
@@ -771,7 +754,7 @@ def train_model(model):
         optimizer.step()
         model.reset_synonym_relation()
 
-        losses.append(loss.data.cpu()[0])
+        losses.append(loss.data.cpu().item())
         steps += 1
 
         if steps in (1, 10, 20, 50, 100) or steps % 100 == 0:
@@ -785,8 +768,7 @@ def train_model(model):
         if steps % 5000 == 0:
             model.cpu()
             torch.save(model.state_dict(), MODEL_FILENAME)
-            if model.float_type == torch.cuda.FloatTensor:
-                model.cuda()
+            model.to(model.device)
             print("saved")
     print()
 
