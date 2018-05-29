@@ -11,7 +11,9 @@ from torch.utils.data.sampler import Sampler
 from conceptnet5.vectors.formats import save_hdf, save_npy
 import numpy as np
 import pandas as pd
+import copy
 import random
+import re
 import pathlib
 import os
 import contextlib
@@ -36,6 +38,7 @@ LANGUAGES_TO_USE = [
     'en', 'fr', 'de', 'it', 'es', 'ru', 'pt', 'ja', 'zh', 'nl',
     'ar', 'fa', 'ko', 'ms', 'no', 'pl', 'sv', 'mul'
 ]
+BATCH_SIZE=128
 
 random.seed(0)
 
@@ -114,18 +117,16 @@ class EdgeDataset(Dataset):
     Wrapper class (around an iteration over ConceptNet edges) that enables us 
     to use a torch DataLoader to parallelize generation of training batches.
     '''
-    def __init__(self, filename, index, n_terms, batch_size):
+    def __init__(self, filename, index):
         '''
         Construct an edge dataset from a filename (of a tab-separated 
-        ConceptNet edge file, which should be in random order), a (pandas) 
-        index mapping (row) numbers to terms of the ConceptNet vocabulary, 
-        the (total) number of such terms, and a batch size. 
+        ConceptNet edge file, which should be in random order), and a (pandas) 
+        index mapping (row) numbers to terms of the ConceptNet vocabulary. 
         '''
         super().__init__()
         self.filename = filename
         self.index = index
-        self.n_terms = n_terms
-        self.batch_size = batch_size
+        self.n_terms = len(self.index)
         # Cache the edges in CPU memory as torch LongTensors,
         # skipping edges we don't intend to process.
         rel_indices = []
@@ -281,7 +282,74 @@ class SemanticMatchingModel(nn.Module):
     """
     The PyTorch model for semantic matching energy over ConceptNet.
     """
-    def __init__(self, frame, use_cuda=True, relation_dim=10, batch_size=128):
+    def __init__(self, index, use_cuda=True, term_dim=300, relation_dim=10,
+                 batch_size=BATCH_SIZE):
+        """
+        Parameters:
+
+        `index`: a pandas Index of words corresponding to the rows of the 
+        term embedding to be learned.
+        
+        `term_dim`: the number of dimensions in the term embedding.
+
+        `use_cuda`: whether to use GPU-accelerated PyTorch objects.
+
+        `relation_dim`: the number of dimensions in the relation embeddings.
+        Unlike SME as published, this can differ from the dimensionality of
+        the term embeddings.
+
+        `batch_size`: how many positive examples to use in each batch.
+        The number of negative examples is NEG_SAMPLES times batch_size.
+        """
+        super().__init__()
+        self.batch_size = batch_size
+
+        # Initialize term embeddings, including the index that converts terms
+        # from strings to row numbers
+        self.index = index
+        self.term_vecs = nn.Embedding(len(self.index), term_dim,
+                                      sparse=True)
+
+        # The assoc_tensor is a (k_2 x k_1 x k_1) tensor that represents
+        # interactions between the relations and the terms. k_1 is the
+        # dimensionality of the term embeddings, and k_2 is the dimensionality
+        # of the relation embeddings.
+        #
+        # We pass the dimensions in the order (k_1, k_1, k_2) because the
+        # PyTorch convention is that inputs come before outputs, but the
+        # resulting tensor is (k_2 x k_1 x k_1) because the math convention
+        # is that outputs are on the left.
+        self.assoc_tensor = nn.Bilinear(
+            term_dim, term_dim, relation_dim, bias=True
+        )
+        self.rel_vecs = nn.Embedding(N_RELS, relation_dim, sparse=True)
+
+        # Using CUDA to run on the GPU requires different data types
+        if use_cuda and torch.cuda.is_available():
+            self.device = torch.device('cuda')
+        else:
+            self.device = torch.device('cpu')
+
+        self.register_buffer('identity_slice', 
+                             torch.tensor(np.eye(term_dim),
+                                          dtype=torch.float32,
+                                          device=self.device))
+        self.reset_synonym_relation()
+
+        # Learnable priors for how confident to be in arbitrary statements.
+        # These are used to convert the tensor products linearly into logits.
+        # The initial values of these are set to numbers that appeared
+        # reasonable based on a previous run.
+        self.truth_multiplier = nn.Parameter(torch.tensor(
+            5.0, dtype=torch.float32, device=self.device))
+        self.truth_offset = nn.Parameter(torch.tensor(
+            -3.0, dtype=torch.float32, device=self.device))
+
+        self.to(self.device) # make sure everything is on the right device
+
+    @classmethod
+    def from_frame(cls, frame, use_cuda=True, relation_dim=10,
+                   batch_size=BATCH_SIZE):
         """
         Parameters:
 
@@ -298,67 +366,14 @@ class SemanticMatchingModel(nn.Module):
         `batch_size`: how many positive examples to use in each batch.
         The number of negative examples is NEG_SAMPLES times batch_size.
         """
-        super().__init__()
-        self.n_terms, self.term_dim = frame.shape
-        self.relation_dim = relation_dim
-        self.batch_size = batch_size
-
-        # Initialize term embeddings, including the index that converts terms
-        # from strings to row numbers
-        self.index = frame.index
-        self.term_vecs = nn.Embedding(frame.shape[0], self.term_dim,
-                                      sparse=True)
-        self.term_vecs.weight.data.copy_(
+        model = cls(frame.index, term_dim=frame.values.shape[1],
+                    use_cuda=use_cuda, relation_dim=relation_dim,
+                    batch_size=batch_size)
+        model.term_vecs.weight.data.copy_(
             torch.from_numpy(frame.values)
         )
-
-        # The assoc_tensor is a (k_2 x k_1 x k_1) tensor that represents
-        # interactions between the relations and the terms. k_1 is the
-        # dimensionality of the term embeddings, and k_2 is the dimensionality
-        # of the relation embeddings.
-        #
-        # We pass the dimensions in the order (k_1, k_1, k_2) because the
-        # PyTorch convention is that inputs come before outputs, but the
-        # resulting tensor is (k_2 x k_1 x k_1) because the math convention
-        # is that outputs are on the left.
-        self.assoc_tensor = nn.Bilinear(
-            self.term_dim, self.term_dim, self.relation_dim, bias=True
-        )
-        self.rel_vecs = nn.Embedding(N_RELS, self.relation_dim, sparse=True)
-
-        # Using CUDA to run on the GPU requires different data types
-        if use_cuda and torch.cuda.is_available():
-            self.device = torch.device('cuda')
-        else:
-            self.device = torch.device('cpu')
-
-        print('Initializing edge dataset ....')
-        dataset_accumulator = TimeAccumulator()
-        with stopwatch(dataset_accumulator):
-            self.dataset = EdgeDataset(
-                EDGES_FILENAME,
-                self.index,
-                self.n_terms, 
-                self.batch_size
-            )
-        dataset_accumulator.print('Edge dataset initialization took')
-        print('Edge dataset contains {} edges.'.format(len(self.dataset)))
-
-        self.identity_slice = torch.tensor(np.eye(self.term_dim),
-                                           dtype=torch.float32,
-                                           device=self.device)
-        self.reset_synonym_relation()
-
-        # Learnable priors for how confident to be in arbitrary statements.
-        # These are used to convert the tensor products linearly into logits.
-        # The initial values of these are set to numbers that appeared
-        # reasonable based on a previous run.
-        self.truth_multiplier = nn.Parameter(torch.tensor(
-            5.0, dtype=torch.float32, device=self.device))
-        self.truth_offset = nn.Parameter(torch.tensor(
-            -3.0, dtype=torch.float32, device=self.device))
-
-        self.to(self.device) # make sure everything is on the right device
+        return model
+        
 
     def reset_synonym_relation(self):
         """
@@ -430,12 +445,16 @@ class SemanticMatchingModel(nn.Module):
         """
         Load the pre-computed embeddings that form our starting point.
         """
-        frame = load_hdf(INITIAL_VECS_FILENAME)
-        labels = [
-            label for label in frame.index
-            if get_uri_language(label) in LANGUAGES_TO_USE
-        ]
-        frame = frame.loc[labels]
+        accumulator = TimeAccumulator()
+        with stopwatch(accumulator):
+            print('Loading frame from file {}.'.format(INITIAL_VECS_FILENAME))
+            frame = load_hdf(INITIAL_VECS_FILENAME)
+            labels = [
+                label for label in frame.index
+                if get_uri_language(label) in LANGUAGES_TO_USE
+            ]
+            frame = frame.loc[labels]
+        accumulator.print('Loading frame took')
         return frame.astype(np.float32)
 
     @staticmethod
@@ -443,18 +462,23 @@ class SemanticMatchingModel(nn.Module):
         """
         Load the SME model from a file.
         """
-        frame = SemanticMatchingModel.load_initial_frame()
-        model = SemanticMatchingModel(l2_normalize_rows(frame))
-        # We have adopted the convention that models are moved to the
-        # cpu before saving their state (as else loading would need
-        # twice the gpu memory).  We (currently) do not support building
-        # a model on the gpu and loading it on the cpu (or conversely).
-        model.cpu()
-        model.load_state_dict(torch.load(filename))
-        model.to(model.device)
+        accumulator = TimeAccumulator()
+        with stopwatch(accumulator):
+            print('Loading model from file {}.'.format(filename))
+            frame = SemanticMatchingModel.load_initial_frame()
+            model = SemanticMatchingModel(frame.index)
+            # We have adopted the convention that models are moved to the
+            # cpu before saving their state (as else loading would need
+            # twice the gpu memory).  We (currently) do not support building
+            # a model on the gpu and loading it on the cpu (or conversely).
+            model.cpu()
+            model.load_state_dict(torch.load(filename))
+            model.to(model.device)
+        accumulator.print('Total time to load model:')
         return model
 
-    def evaluate_conceptnet(self, cutoff_value=-1, output_filename=None):
+    def evaluate_conceptnet(self, dataset, cutoff_value=-1,
+                            output_filename=None):
         """
         Use the SME model to "sanity-check" existing edges in ConceptNet.
         We particularly highlight edges that get a value of -1 or less, which
@@ -466,7 +490,7 @@ class SemanticMatchingModel(nn.Module):
             out = open(output_filename, 'w', encoding='utf-8')
         else:
             out = None
-        for rel, left, right, weight in self.dataset.iter_edges_once():
+        for rel, left, right, weight in dataset.iter_edges_once():
             try:
                 rel_idx = RELATION_INDEX.get_loc(rel)
                 left_idx = self.index.get_loc(left)
@@ -615,9 +639,6 @@ class SGD_Sparse(optim.SGD):
                         if len(d_p._indices().size()) < 2: # empty sparse tensor
                             pass
                         else:
-                            ctor = eval(d_p.type())
-                            index_ctor = torch.cuda.LongTensor if d_p.is_cuda \
-                                         else torch.LongTensor
                             # Find the indices of the nonzero entries in the
                             # gradient, assuming row-major storage order, by
                             # finding the index of each nonzero subtensor's
@@ -628,7 +649,8 @@ class SGD_Sparse(optim.SGD):
                             values_shape = tuple(d_p._values().size())
                             assert len(values_shape) > 0
                             assert n_values == values_shape[0]
-                            value_size = np.prod(np.array(values_shape[1:]))
+                            value_size = int(np.prod(np.array(
+                                values_shape[1:])))
                             factors = np.array(d_p.size())
                             factors = np.flip(factors, axis=0)
                             factors = np.append(np.array([1]), factors[:-1])
@@ -636,34 +658,50 @@ class SGD_Sparse(optim.SGD):
                             factors = np.flip(factors, axis=0)
                             factors = factors.tolist() # lose negative strides
                             assert n_sparse_dims <= len(factors)
-                            flat_indices0 = index_ctor(np.zeros(
-                                shape=(n_values,), dtype=np.int64))
+                            flat_indices0 = torch.zeros(
+                                n_values, dtype=torch.int64, device=d_p.device)
                             for i_sparse_dim in range(n_sparse_dims):
                                 flat_indices0.add_(
                                     factors[i_sparse_dim],
                                     d_p._indices()[i_sparse_dim])
                             flat_indices0.unsqueeze_(1)
-                            offsets = index_ctor(np.arange(
-                                value_size, dtype=np.int64)).unsqueeze(0)
+                            offsets = torch.arange(value_size, 
+                                dtype=torch.int64, device=d_p.device).\
+                                unsqueeze(0)
                             flat_indices = \
                                 torch.index_select(
                                     flat_indices0, 1,
-                                    index_ctor(np.zeros((value_size,),
-                                                        dtype=np.int64))) \
+                                    torch.zeros(
+                                        value_size, 
+                                        dtype=torch.int64,
+                                        device=d_p.device)) \
                                 + \
                                 torch.index_select(
                                     offsets, 0,
-                                    index_ctor(np.zeros((n_values,),
-                                                        dtype=np.int64)))
+                                    torch.zeros(
+                                        n_values,
+                                        dtype=torch.int64,
+                                        device=d_p.device))
                             flat_indices.resize_(values_shape)
                             del flat_indices0, offsets
-                            sparse_data = ctor(
-                                d_p._indices(),
-                                torch.take(p.data, flat_indices),
-                                d_p.size()
-                            )
+                            ctor = eval(d_p.type())
+                            vals = torch.take(p.data, flat_indices)
+                            try: 
+                                sparse_data = ctor(
+                                    d_p._indices(), vals, d_p.size())
+                            except RuntimeError:
+                                # This looks like a bug in pytorch; sparse
+                                # tensors evidently cannot be created on
+                                # every gpu, even if all the data is on the
+                                # same gpu.  The workaround:  construct the 
+                                # sparse tensor on the cpu then move it.
+                                ctor_cpu = eval(
+                                    re.sub('\.cuda', '', d_p.type()))
+                                sparse_data = ctor_cpu(
+                                    d_p._indices().cpu(), vals.cpu(),
+                                    d_p.size()).to(d_p.device)
                             d_p.add_(weight_decay, sparse_data)
-                            del flat_indices, sparse_data
+                            del flat_indices, sparse_data, vals
                 if momentum != 0:
                     param_state = self.state[p]
                     if 'momentum_buffer' not in param_state:
@@ -688,19 +726,144 @@ class SGD_Sparse(optim.SGD):
         return loss
 
 
-
-def train_model(model):
+class DataParallelizedModule(nn.Module):
     """
-    Incrementally train the model.
+    Similarly to nn.DataParallel, this class of modules serves to wrap 
+    other modules and run them in parallel over multiple gpus, splitting 
+    training (or testing/application) batches between the gpus (over the 
+    first dimension of the batch).  
+    
+    Unlike nn.DataParallel, all of the wrapped module's parameters will be 
+    copied to all gpus during construction of the wrapper, and only gradient 
+    data will be copied from gpu to gpu during training (no data should need 
+    to be copied between gpus during forward application).  However, training 
+    should only use loss functions that can be expressed as averages over all 
+    data points of a batch of some per-data-point loss.  Also, the set of 
+    parameters of the wrapped module is assumed not to change (of course their 
+    values can change) over the lifetime of the wrapper object.
+    
+    Note that during training of a wrapped module, it is necessary to call 
+    the wrapper's broadcast_gradients method immediately following the 
+    backpropagation of gradients (i.e. typically right after calling 
+    .backward on some loss tensor), in order to share corrections to the 
+    computed gradients between the gpus.
+    """
+    def __init__(self, module, device, copy_fn=copy.deepcopy):
+        """
+        Construct a parallelizing wrapper for the given module (an instance 
+        of nn.Module).  The module will be moved to the given device (if 
+        not already there) and copies will be made using the given copy 
+        function (defaulting to copy.deepcopy) and placed on all other 
+        available gpus.
+        """
+        super().__init__()
+        device_ids = list(range(torch.cuda.device_count()))
+        devices = [torch.device('cuda:{}'.format(d_id)) for d_id in device_ids]
+        if device not in devices:
+            device = devices[0]
+        self.children = [module]
+        self.devices = [device]
+        self.add_module('child:{}'.format(device.index), module)
+        for dev in devices:
+            if dev != device:
+                self.devices.append(dev)
+        for dev in self.devices[1:]:
+            module.cpu()
+            module_copy = copy_fn(module)
+            module_copy.to(dev)
+            self.children.append(module_copy)
+            self.add_module('child:{}'.format(dev.index), module_copy)
+        module.to(device)
+        self.chunk_sizes = torch.zeros(len(self.children), dtype=torch.int64)
+
+    def forward(self, *args):
+        """
+        Scatter the supplied args (assumed to be a list of tensors) across 
+        the child modules, and gather their outputs (assumed to be single 
+        tensors) back to the first gpu.  Also, accumulate the sizes of the 
+        scattered chunks (for later use in updating parameter gradients).
+        """
+        if len(self.children) <= 1:
+            return self.children[0](*args)
+        device_ids = [device.index for device in self.devices]
+        chunk_lists = list(list() for i_device in device_ids)
+        for arg in args:
+            chunks = torch.cuda.comm.scatter(arg, device_ids)
+            for i_child, chunk in enumerate(chunks):
+                chunk_lists[i_child].append(chunk)
+        chunks = list(tuple(chunk_list) for chunk_list in chunk_lists)
+        outputs = []
+        for i_child, (module, chunk) in enumerate(zip(self.children, chunks)):
+            chunk_size = chunk[0].size()[0]
+            self.chunk_sizes[i_child] += chunk_size
+            output = module(*chunk)
+            outputs.append(output)
+        assert len(self.children) == len(outputs)
+        output = torch.cuda.comm.gather(
+            outputs, destination=self.devices[0].index)
+        return output
+
+    def zero_grad(self):
+        """
+        In addition to the ordinary zeroing of gradient data, reset the 
+        chunk size data.
+        """
+        super().zero_grad()
+        self.chunk_sizes = torch.zeros(len(self.children), dtype=torch.int64)
+
+    def broadcast_gradients(self):
+        """
+        Compute a single value, for all the child modules, of the gradient 
+        of each module parameter (as a convex combination of the gradients 
+        in the individual children, with coefficients based on the batch 
+        sizes from the forward computation), and distribute these common 
+        gradients back to all the children.
+        """
+        if len(self.children) <= 1:
+            return
+        weights = self.chunk_sizes.to(torch.float32) / \
+                  self.chunk_sizes.sum().to(torch.float32)
+        weights = [weights[ii].item() for ii, dev in
+                   enumerate(self.devices)]
+        for name, param in self.children[0].named_parameters():
+            if param.grad is None:
+                continue
+            param_copies = [param]
+            for other_module in self.children[1:]:
+                other_module_params = list(
+                    p for other_name, p in other_module.named_parameters()
+                    if other_name == name)
+                assert len(other_module_params) == 1
+                param_copies.append(other_module_params[0])
+            param_grad = torch.cuda.comm.reduce_add(
+                list(param_copy.grad.mul_(weight) for param_copy, weight in
+                     zip(param_copies, weights)), 
+                destination=self.devices[0].index)
+            for ii, param_copy in enumerate(param_copies):
+                param_copy.grad = param_grad.to(self.devices[ii])
+
+
+
+def train_model(model, dataset):
+    """
+    Incrementally train the model on the given dataset.
 
     As it is, this function will never return. It writes the results so far
     to `sme/sme.model` every 5000 iterations, and you can run it for as
     long as you want.
     """
     model.train()
-    if model.device != torch.device('cpu') \
-       and torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        parallel_model = nn.DataParallel(model)
+    
+    def model_copier(model):
+        model.cpu()
+        new_model = SemanticMatchingModel(model.index, use_cuda=False,
+                                          batch_size=model.batch_size)
+        new_model.load_state_dict(model.state_dict())
+        return new_model
+
+    if torch.cuda.is_available()and torch.cuda.device_count() > 1:
+        parallel_model = DataParallelizedModule(
+            model, model.device, copy_fn=model_copier)
     else:
         parallel_model = model
         
@@ -726,16 +889,20 @@ def train_model(model):
     steps = 0
 
     # Note that you want drop_last=False with a CyclingSampler.
-    data_loader = DataLoader(model.dataset, batch_size=model.batch_size,
+    data_loader = DataLoader(dataset, batch_size=model.batch_size,
                              drop_last=False, num_workers=10,
-                             collate_fn=model.dataset.collate_batch,
-                             sampler=CyclingSampler(model.dataset),
+                             collate_fn=dataset.collate_batch,
+                             sampler=CyclingSampler(dataset),
                              pin_memory=True)
     for pos_batch, neg_batch, weights in data_loader:
         if model.device != torch.device('cpu'):
-            pos_batch = tuple(x.cuda(async=True) for x in pos_batch)
-            neg_batch = tuple(x.cuda(async=True) for x in neg_batch)
-            weights = weights.cuda(async=True)
+            pos_batch = tuple(
+                x.cuda(device=model.device, non_blocking=True)
+                for x in pos_batch)
+            neg_batch = tuple(
+                x.cuda(device=model.device, non_blocking=True)
+                for x in neg_batch)
+            weights = weights.cuda(device=model.device, non_blocking=True)
         parallel_model.zero_grad()
         pos_energy = parallel_model(*pos_batch)
         neg_energy = parallel_model(*neg_batch)
@@ -750,9 +917,20 @@ def train_model(model):
         loss = abs_loss + rel_loss
         loss.backward()
 
-        clip_grad_norm(parallel_model.parameters(), 1)
+        if model != parallel_model:
+            parallel_model.broadcast_gradients()
+            for model_copy in parallel_model.children:
+                clip_grad_norm(model_copy.parameters(), 1)
+        else:
+            clip_grad_norm(model.parameters(), 1)
+        
         optimizer.step()
-        model.reset_synonym_relation()
+        
+        if model == parallel_model:
+            model.reset_synonym_relation()
+        else:
+            for model_copy in parallel_model.children:
+                model_copy.reset_synonym_relation()
 
         losses.append(loss.data.cpu().item())
         steps += 1
@@ -765,11 +943,24 @@ def train_model(model):
                 steps, avg_loss, abs_loss, rel_loss
             ))
             losses.clear()
+
         if steps % 5000 == 0:
             model.cpu()
             torch.save(model.state_dict(), MODEL_FILENAME)
             model.to(model.device)
             print("saved")
+            # Sanity check:  if the model has been parallelized across
+            # multiple gpu's, the parameters across all gpu's should agree.
+            if model != parallel_model:
+                for child in parallel_model.children:
+                    for name, param in model.named_parameters():
+                        child_params = list(
+                            p for other_name, p in child.named_parameters()
+                            if name == other_name)
+                        assert len(child_params) == 1
+                        assert torch.norm((param.data.cpu() -
+                                           child_params[0].data.cpu())) < 1e-6
+        
     print()
 
 
@@ -783,11 +974,17 @@ def get_model():
         model = SemanticMatchingModel.load_model(MODEL_FILENAME)
     else:
         frame = SemanticMatchingModel.load_initial_frame()
-        model = SemanticMatchingModel(l2_normalize_rows(frame))
+        model = SemanticMatchingModel.from_frame(l2_normalize_rows(frame))
     return model
 
 
 if __name__ == '__main__':
     model = get_model()
-    train_model(model)
-    # model.evaluate_conceptnet()
+    print('Initializing edge dataset ....')
+    dataset_accumulator = TimeAccumulator()
+    with stopwatch(dataset_accumulator):
+        dataset = EdgeDataset(EDGES_FILENAME, model.index)
+    dataset_accumulator.print('Edge dataset initialization took')
+    print('Edge dataset contains {} edges.'.format(len(dataset)))
+    train_model(model, dataset)
+    # model.evaluate_conceptnet(dataset)
