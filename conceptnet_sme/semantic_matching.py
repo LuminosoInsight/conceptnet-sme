@@ -282,8 +282,7 @@ class SemanticMatchingModel(nn.Module):
     """
     The PyTorch model for semantic matching energy over ConceptNet.
     """
-    def __init__(self, index, use_cuda=True, term_dim=300, relation_dim=10,
-                 batch_size=BATCH_SIZE):
+    def __init__(self, index, use_cuda=True, term_dim=300, relation_dim=10):
         """
         Parameters:
 
@@ -297,12 +296,8 @@ class SemanticMatchingModel(nn.Module):
         `relation_dim`: the number of dimensions in the relation embeddings.
         Unlike SME as published, this can differ from the dimensionality of
         the term embeddings.
-
-        `batch_size`: how many positive examples to use in each batch.
-        The number of negative examples is NEG_SAMPLES times batch_size.
         """
         super().__init__()
-        self.batch_size = batch_size
 
         # Initialize term embeddings, including the index that converts terms
         # from strings to row numbers
@@ -348,8 +343,7 @@ class SemanticMatchingModel(nn.Module):
         self.to(self.device) # make sure everything is on the right device
 
     @classmethod
-    def from_frame(cls, frame, use_cuda=True, relation_dim=10,
-                   batch_size=BATCH_SIZE):
+    def from_frame(cls, frame, use_cuda=True, relation_dim=10):
         """
         Parameters:
 
@@ -362,13 +356,9 @@ class SemanticMatchingModel(nn.Module):
         `relation_dim`: the number of dimensions in the relation embeddings.
         Unlike SME as published, this can differ from the dimensionality of
         the term embeddings.
-
-        `batch_size`: how many positive examples to use in each batch.
-        The number of negative examples is NEG_SAMPLES times batch_size.
         """
         model = cls(frame.index, term_dim=frame.values.shape[1],
-                    use_cuda=use_cuda, relation_dim=relation_dim,
-                    batch_size=batch_size)
+                    use_cuda=use_cuda, relation_dim=relation_dim)
         model.term_vecs.weight.data.copy_(
             torch.from_numpy(frame.values)
         )
@@ -856,8 +846,7 @@ def train_model(model, dataset):
     
     def model_copier(model):
         model.cpu()
-        new_model = SemanticMatchingModel(model.index, use_cuda=False,
-                                          batch_size=model.batch_size)
+        new_model = SemanticMatchingModel(model.index, use_cuda=False)
         new_model.load_state_dict(model.state_dict())
         return new_model
 
@@ -882,14 +871,14 @@ def train_model(model, dataset):
     optimizer = SGD_Sparse(parallel_model.parameters(), lr=0.1,
                            weight_decay=1e-9)
     losses = []
-    true_target = torch.ones([model.batch_size], dtype=torch.float32,
+    true_target = torch.ones([BATCH_SIZE], dtype=torch.float32,
                              device=model.device)
-    false_target = torch.zeros([model.batch_size], dtype=torch.float32,
+    false_target = torch.zeros([BATCH_SIZE], dtype=torch.float32,
                                device=model.device)
     steps = 0
 
     # Note that you want drop_last=False with a CyclingSampler.
-    data_loader = DataLoader(dataset, batch_size=model.batch_size,
+    data_loader = DataLoader(dataset, batch_size=BATCH_SIZE,
                              drop_last=False, num_workers=10,
                              collate_fn=dataset.collate_batch,
                              sampler=CyclingSampler(dataset),
