@@ -38,7 +38,7 @@ LANGUAGES_TO_USE = [
     'en', 'fr', 'de', 'it', 'es', 'ru', 'pt', 'ja', 'zh', 'nl',
     'ar', 'fa', 'ko', 'ms', 'no', 'pl', 'sv', 'mul'
 ]
-BATCH_SIZE=128
+BATCH_SIZE=160
 
 random.seed(0)
 
