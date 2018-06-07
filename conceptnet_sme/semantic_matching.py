@@ -13,7 +13,6 @@ import numpy as np
 import pandas as pd
 import copy
 import random
-import re
 import pathlib
 import os
 import contextlib
@@ -38,7 +37,24 @@ LANGUAGES_TO_USE = [
     'en', 'fr', 'de', 'it', 'es', 'ru', 'pt', 'ja', 'zh', 'nl',
     'ar', 'fa', 'ko', 'ms', 'no', 'pl', 'sv', 'mul'
 ]
-BATCH_SIZE=160
+BATCH_SIZE = 128
+
+TORCH_SPARSE_TYPE_MAP = {
+    'torch.sparse.FloatTensor' : torch.sparse.FloatTensor,
+    'torch.sparse.DoubleTensor' : torch.sparse.DoubleTensor,
+    'torch.sparse.ByteTensor' : torch.sparse.ByteTensor,
+    'torch.sparse.CharTensor' : torch.sparse.CharTensor,
+    'torch.sparse.ShortTensor' : torch.sparse.ShortTensor,
+    'torch.sparse.IntTensor' : torch.sparse.IntTensor,
+    'torch.sparse.LongTensor' : torch.sparse.LongTensor,
+    'torch.cuda.sparse.FloatTensor' : torch.cuda.sparse.FloatTensor,
+    'torch.cuda.sparse.DoubleTensor' : torch.cuda.sparse.DoubleTensor,
+    'torch.cuda.sparse.ByteTensor' : torch.cuda.sparse.ByteTensor,
+    'torch.cuda.sparse.CharTensor' : torch.cuda.sparse.CharTensor,
+    'torch.cuda.sparse.ShortTensor' : torch.cuda.sparse.ShortTensor,
+    'torch.cuda.sparse.IntTensor' : torch.cuda.sparse.IntTensor,
+    'torch.cuda.sparse.LongTensor' : torch.cuda.sparse.LongTensor
+    }
 
 random.seed(0)
 
@@ -585,7 +601,7 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
 
 
 
-class SGD_Sparse(optim.SGD):
+class SparseSGD(optim.SGD):
     """
     Just like optim.SGD except that this class handles non-zero 
     weight decay and momentum even when some of the parameters 
@@ -633,7 +649,21 @@ class SGD_Sparse(optim.SGD):
                             # gradient, assuming row-major storage order, by
                             # finding the index of each nonzero subtensor's
                             # first entry and adding offsets to the other
-                            # entries.
+                            # entries.  For example, if the gradient is an 
+                            # m x n matrix, and the nonzero subtensors are all
+                            # scalars, then for each column [i,j] of the
+                            # gradient's _indices() we must compute the 1D
+                            # index n*i + j in the gradient of the corresponding
+                            # entry in the gradient's _values(), and, as the
+                            # subtensor is a scalar there is only one offset
+                            # from this start position, namely zero.  If the
+                            # gradient is n0 x n1 x n2 x n3 and the nonzero
+                            # subtensors are 1D, then then the 1D index of the
+                            # first entry of the nonzero subtensor corresponding
+                            # to the column [i0,i0,i2] of _indices() is given by
+                            # n1*n2*n3*i0 + n2*n3*i1 + n3*i2, and the offset
+                            # vector is (0,1,2,...,m-1) where m is the size of
+                            # each nonzero subtensor.
                             assert p.data.size() == d_p.size()
                             n_sparse_dims, n_values = d_p._indices().size()
                             values_shape = tuple(d_p._values().size())
@@ -674,7 +704,7 @@ class SGD_Sparse(optim.SGD):
                                         device=d_p.device))
                             flat_indices.resize_(values_shape)
                             del flat_indices0, offsets
-                            ctor = eval(d_p.type())
+                            ctor = TORCH_SPARSE_TYPE_MAP[d_p.type()]
                             vals = torch.take(p.data, flat_indices)
                             try: 
                                 sparse_data = ctor(
@@ -685,8 +715,8 @@ class SGD_Sparse(optim.SGD):
                                 # every gpu, even if all the data is on the
                                 # same gpu.  The workaround:  construct the 
                                 # sparse tensor on the cpu then move it.
-                                ctor_cpu = eval(
-                                    re.sub('\.cuda', '', d_p.type()))
+                                ctor_cpu = TORCH_SPARSE_TYPE_MAP[
+                                    d_p.type().replace('.cuda', '')]
                                 sparse_data = ctor_cpu(
                                     d_p._indices().cpu(), vals.cpu(),
                                     d_p.size()).to(d_p.device)
@@ -868,8 +898,8 @@ def train_model(model, dataset):
     # probability that accurately reflects the model's confidence.
     absolute_loss_function = nn.BCEWithLogitsLoss()
 
-    optimizer = SGD_Sparse(parallel_model.parameters(), lr=0.1,
-                           weight_decay=1e-9)
+    optimizer = SparseSGD(parallel_model.parameters(), lr=0.1,
+                          weight_decay=1e-9)
     losses = []
     true_target = torch.ones([BATCH_SIZE], dtype=torch.float32,
                              device=model.device)
