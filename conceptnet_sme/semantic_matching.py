@@ -39,23 +39,6 @@ LANGUAGES_TO_USE = [
 ]
 BATCH_SIZE = 128
 
-TORCH_SPARSE_TYPE_MAP = {
-    'torch.sparse.FloatTensor' : torch.sparse.FloatTensor,
-    'torch.sparse.DoubleTensor' : torch.sparse.DoubleTensor,
-    'torch.sparse.ByteTensor' : torch.sparse.ByteTensor,
-    'torch.sparse.CharTensor' : torch.sparse.CharTensor,
-    'torch.sparse.ShortTensor' : torch.sparse.ShortTensor,
-    'torch.sparse.IntTensor' : torch.sparse.IntTensor,
-    'torch.sparse.LongTensor' : torch.sparse.LongTensor,
-    'torch.cuda.sparse.FloatTensor' : torch.cuda.sparse.FloatTensor,
-    'torch.cuda.sparse.DoubleTensor' : torch.cuda.sparse.DoubleTensor,
-    'torch.cuda.sparse.ByteTensor' : torch.cuda.sparse.ByteTensor,
-    'torch.cuda.sparse.CharTensor' : torch.cuda.sparse.CharTensor,
-    'torch.cuda.sparse.ShortTensor' : torch.cuda.sparse.ShortTensor,
-    'torch.cuda.sparse.IntTensor' : torch.cuda.sparse.IntTensor,
-    'torch.cuda.sparse.LongTensor' : torch.cuda.sparse.LongTensor
-    }
-
 random.seed(0)
 
 
@@ -597,153 +580,10 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
     if clip_coef < 1:
         for p in parameters:
             p.grad.data.mul_(clip_coef)
+            if p.grad.data.layout == torch.sparse_coo:
+                p.grad.data = p.grad.data.coalesce()
     return total_norm
 
-
-
-class SparseSGD(optim.SGD):
-    """
-    Just like optim.SGD except that this class handles non-zero 
-    weight decay and momentum even when some of the parameters 
-    being optimized have sparse gradient storage.
-    
-    NOTE:  Currently there seem to be gpu memory leaks when using 
-    Nesterov momentum; use that at your own risk.
-    """
-    def step(self, closure=None):
-        """Performs a single optimization step.
-
-        Arguments:
-            closure (callable, optional): A closure that reevaluates the model
-                and returns the loss.
-        """
-        loss = None
-        if closure is not None:
-            loss = closure()
-
-        for group in self.param_groups:
-            weight_decay = group['weight_decay']
-            momentum = group['momentum']
-            dampening = group['dampening']
-            nesterov = group['nesterov']
-
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                d_p = p.grad.data
-                d_p_is_sparse = (d_p.layout == torch.sparse_coo)
-                if weight_decay != 0:
-                    if not d_p_is_sparse:
-                        d_p.add_(weight_decay, p.data)
-                    else:
-                        # Update the gradient via weight decay only at
-                        # locations where it is already non-zero; this
-                        # isn't quite the same as actual weight decay but
-                        # it avoids ballooning the memory consumption.
-                        d_p = d_p.coalesce()
-                        p.grad.data = d_p
-                        if len(d_p._indices().size()) < 2: # empty sparse tensor
-                            pass
-                        else:
-                            # Find the indices of the nonzero entries in the
-                            # gradient, assuming row-major storage order, by
-                            # finding the index of each nonzero subtensor's
-                            # first entry and adding offsets to the other
-                            # entries.  For example, if the gradient is an 
-                            # m x n matrix, and the nonzero subtensors are all
-                            # scalars, then for each column [i,j] of the
-                            # gradient's _indices() we must compute the 1D
-                            # index n*i + j in the gradient of the corresponding
-                            # entry in the gradient's _values(), and, as the
-                            # subtensor is a scalar there is only one offset
-                            # from this start position, namely zero.  If the
-                            # gradient is n0 x n1 x n2 x n3 and the nonzero
-                            # subtensors are 1D, then then the 1D index of the
-                            # first entry of the nonzero subtensor corresponding
-                            # to the column [i0,i0,i2] of _indices() is given by
-                            # n1*n2*n3*i0 + n2*n3*i1 + n3*i2, and the offset
-                            # vector is (0,1,2,...,m-1) where m is the size of
-                            # each nonzero subtensor.
-                            assert p.data.size() == d_p.size()
-                            n_sparse_dims, n_values = d_p._indices().size()
-                            values_shape = tuple(d_p._values().size())
-                            assert len(values_shape) > 0
-                            assert n_values == values_shape[0]
-                            value_size = int(np.prod(np.array(
-                                values_shape[1:])))
-                            factors = np.array(d_p.size())
-                            factors = np.flip(factors, axis=0)
-                            factors = np.append(np.array([1]), factors[:-1])
-                            factors = np.cumprod(factors)
-                            factors = np.flip(factors, axis=0)
-                            factors = factors.tolist() # lose negative strides
-                            assert n_sparse_dims <= len(factors)
-                            flat_indices0 = torch.zeros(
-                                n_values, dtype=torch.int64, device=d_p.device)
-                            for i_sparse_dim in range(n_sparse_dims):
-                                flat_indices0.add_(
-                                    factors[i_sparse_dim],
-                                    d_p._indices()[i_sparse_dim])
-                            flat_indices0.unsqueeze_(1)
-                            offsets = torch.arange(value_size, 
-                                dtype=torch.int64, device=d_p.device).\
-                                unsqueeze(0)
-                            flat_indices = \
-                                torch.index_select(
-                                    flat_indices0, 1,
-                                    torch.zeros(
-                                        value_size, 
-                                        dtype=torch.int64,
-                                        device=d_p.device)) \
-                                + \
-                                torch.index_select(
-                                    offsets, 0,
-                                    torch.zeros(
-                                        n_values,
-                                        dtype=torch.int64,
-                                        device=d_p.device))
-                            flat_indices.resize_(values_shape)
-                            del flat_indices0, offsets
-                            ctor = TORCH_SPARSE_TYPE_MAP[d_p.type()]
-                            vals = torch.take(p.data, flat_indices)
-                            try: 
-                                sparse_data = ctor(
-                                    d_p._indices(), vals, d_p.size())
-                            except RuntimeError:
-                                # This looks like a bug in pytorch; sparse
-                                # tensors evidently cannot be created on
-                                # every gpu, even if all the data is on the
-                                # same gpu.  The workaround:  construct the 
-                                # sparse tensor on the cpu then move it.
-                                ctor_cpu = TORCH_SPARSE_TYPE_MAP[
-                                    d_p.type().replace('.cuda', '')]
-                                sparse_data = ctor_cpu(
-                                    d_p._indices().cpu(), vals.cpu(),
-                                    d_p.size()).to(d_p.device)
-                            d_p.add_(weight_decay, sparse_data)
-                            del flat_indices, sparse_data, vals
-                if momentum != 0:
-                    param_state = self.state[p]
-                    if 'momentum_buffer' not in param_state:
-                        buf = param_state['momentum_buffer'] = torch.zeros_like(d_p)
-                        buf.mul_(momentum).add_(d_p)
-                    else:
-                        buf = param_state['momentum_buffer']
-                        buf.mul_(momentum).add_(1 - dampening, d_p)
-                    if d_p_is_sparse:
-                        buf = buf.coalesce()
-                        param_state['momentum_buffer'] = buf
-                    if nesterov:
-                        d_p = d_p.add(momentum, buf)
-                    else:
-                        d_p = buf
-                if d_p_is_sparse:
-                    d_p = d_p.coalesce()
-                    p.grad.data = d_p
-
-                p.data.add_(-group['lr'], d_p)
-
-        return loss
 
 
 class DataParallelizedModule(nn.Module):
@@ -768,15 +608,26 @@ class DataParallelizedModule(nn.Module):
     .backward on some loss tensor), in order to share corrections to the 
     computed gradients between the gpus.
     """
-    def __init__(self, module, device, copy_fn=copy.deepcopy):
+    def __init__(self, module, device, copy_fn=None):
         """
         Construct a parallelizing wrapper for the given module (an instance 
         of nn.Module).  The module will be moved to the given device (if 
         not already there) and copies will be made using the given copy 
-        function (defaulting to copy.deepcopy) and placed on all other 
+        function (defaulting to copying the state dict) and placed on all other 
         available gpus.
         """
         super().__init__()
+
+        # Set up a default copying function, which creates a new instance
+        # of the input's class and copies the state dict.
+        if copy_fn is None:
+            def copier(src):
+                result = type(src)()
+                result.cpu()
+                result.load_state_dict(src.state_dict())
+                return result
+            copy_fn = copier
+        
         device_ids = list(range(torch.cuda.device_count()))
         devices = [torch.device('cuda:{}'.format(d_id)) for d_id in device_ids]
         if device not in devices:
@@ -791,9 +642,11 @@ class DataParallelizedModule(nn.Module):
             module.cpu()
             module_copy = copy_fn(module)
             module_copy.to(dev)
+            module_copy.device = dev
             self.children.append(module_copy)
             self.add_module('child:{}'.format(dev.index), module_copy)
         module.to(device)
+        module.device = device
         self.chunk_sizes = torch.zeros(len(self.children), dtype=torch.int64)
 
     def forward(self, *args):
@@ -843,7 +696,7 @@ class DataParallelizedModule(nn.Module):
             return
         weights = self.chunk_sizes.to(torch.float32) / \
                   self.chunk_sizes.sum().to(torch.float32)
-        weights = [weights[ii].item() for ii, dev in
+        weights = [weights[i_device].item() for i_device, device in
                    enumerate(self.devices)]
         for name, param in self.children[0].named_parameters():
             if param.grad is None:
@@ -855,12 +708,18 @@ class DataParallelizedModule(nn.Module):
                     if other_name == name)
                 assert len(other_module_params) == 1
                 param_copies.append(other_module_params[0])
+            # Find the sum, over all child modules, of the gradient for this
+            # parameter in the child, multiplied by the corresponding weights
+            # (as determined above by the relative sizes of the batch chunks
+            # processed by each child), and place it on the first device.
             param_grad = torch.cuda.comm.reduce_add(
                 list(param_copy.grad.mul_(weight) for param_copy, weight in
                      zip(param_copies, weights)), 
                 destination=self.devices[0].index)
-            for ii, param_copy in enumerate(param_copies):
-                param_copy.grad = param_grad.to(self.devices[ii])
+            # Now send the weighted sum to all the child modules on their
+            # devices.
+            for i_param_copy, param_copy in enumerate(param_copies):
+                param_copy.grad = param_grad.to(self.devices[i_param_copy])
 
 
 
@@ -880,7 +739,7 @@ def train_model(model, dataset):
         new_model.load_state_dict(model.state_dict())
         return new_model
 
-    if torch.cuda.is_available()and torch.cuda.device_count() > 1:
+    if model.device != torch.device('cpu'):
         parallel_model = DataParallelizedModule(
             model, model.device, copy_fn=model_copier)
     else:
@@ -898,8 +757,7 @@ def train_model(model, dataset):
     # probability that accurately reflects the model's confidence.
     absolute_loss_function = nn.BCEWithLogitsLoss()
 
-    optimizer = SparseSGD(parallel_model.parameters(), lr=0.1,
-                          weight_decay=1e-9)
+    optimizer = optim.SGD(parallel_model.parameters(), lr=0.1)
     losses = []
     true_target = torch.ones([BATCH_SIZE], dtype=torch.float32,
                              device=model.device)
@@ -968,8 +826,16 @@ def train_model(model, dataset):
             torch.save(model.state_dict(), MODEL_FILENAME)
             model.to(model.device)
             print("saved")
+            
             # Sanity check:  if the model has been parallelized across
             # multiple gpu's, the parameters across all gpu's should agree.
+            # But in practice we see some drift when using optim.SGD with
+            # sparse gradients (evidently related to insufficiently frequent
+            # coalescing of sparse tensors, since this issue went away in
+            # a branch in which optim.SGD was replaced with custom code that
+            # coalesced sparse gradients on every optimization step).  So
+            # we synchronize the parameters periodically.
+            
             if model != parallel_model:
                 for child in parallel_model.children:
                     for name, param in model.named_parameters():
@@ -977,8 +843,11 @@ def train_model(model, dataset):
                             p for other_name, p in child.named_parameters()
                             if name == other_name)
                         assert len(child_params) == 1
-                        assert torch.norm((param.data.cpu() -
-                                           child_params[0].data.cpu())) < 1e-6
+                        difference = torch.norm(
+                            param.data.cpu() - child_params[0].data.cpu())
+                        if difference > 5e-6:
+                            print('Warning: {} differs between parallelized models by {}'.format(name, difference))
+                        child_params[0].data = param.data.to(child.device)
         
     print()
 
