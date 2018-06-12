@@ -37,7 +37,7 @@ LANGUAGES_TO_USE = [
     'en', 'fr', 'de', 'it', 'es', 'ru', 'pt', 'ja', 'zh', 'nl',
     'ar', 'fa', 'ko', 'ms', 'no', 'pl', 'sv', 'mul'
 ]
-BATCH_SIZE = 128
+BATCH_SIZE = 160
 
 random.seed(0)
 
@@ -281,13 +281,14 @@ class SemanticMatchingModel(nn.Module):
     """
     The PyTorch model for semantic matching energy over ConceptNet.
     """
-    def __init__(self, index, use_cuda=True, term_dim=300, relation_dim=10):
+    def __init__(self, frame, use_cuda=True, term_dim=300, relation_dim=10):
         """
         Parameters:
 
-        `index`: a pandas Index of words corresponding to the rows of the 
-        term embedding to be learned.
-        
+        `frame`: a pandas DataFrame of pre-trained word embeddings over the
+        vocabulary of ConceptNet. `conceptnet5.vectors.formats.load_hdf`
+        can load these.
+
         `term_dim`: the number of dimensions in the term embedding.
 
         `use_cuda`: whether to use GPU-accelerated PyTorch objects.
@@ -300,9 +301,9 @@ class SemanticMatchingModel(nn.Module):
 
         # Initialize term embeddings, including the index that converts terms
         # from strings to row numbers
-        self.index = index
-        self.term_vecs = nn.Embedding(len(self.index), term_dim,
-                                      sparse=True)
+        self.index = frame.index
+        self.term_vecs = nn.Embedding(len(self.index), term_dim, sparse=True)
+        self.term_vecs.weight.data.copy_(torch.from_numpy(frame.values))
 
         # The assoc_tensor is a (k_2 x k_1 x k_1) tensor that represents
         # interactions between the relations and the terms. k_1 is the
@@ -320,7 +321,7 @@ class SemanticMatchingModel(nn.Module):
 
         # Using CUDA to run on the GPU requires different data types
         if use_cuda and torch.cuda.is_available():
-            self.device = torch.device('cuda')
+            self.device = torch.device('cuda:0')
         else:
             self.device = torch.device('cpu')
 
@@ -340,29 +341,6 @@ class SemanticMatchingModel(nn.Module):
             -3.0, dtype=torch.float32, device=self.device))
 
         self.to(self.device) # make sure everything is on the right device
-
-    @classmethod
-    def from_frame(cls, frame, use_cuda=True, relation_dim=10):
-        """
-        Parameters:
-
-        `frame`: a pandas DataFrame of pre-trained word embeddings over the
-        vocabulary of ConceptNet. `conceptnet5.vectors.formats.load_hdf`
-        can load these.
-
-        `use_cuda`: whether to use GPU-accelerated PyTorch objects.
-
-        `relation_dim`: the number of dimensions in the relation embeddings.
-        Unlike SME as published, this can differ from the dimensionality of
-        the term embeddings.
-        """
-        model = cls(frame.index, term_dim=frame.values.shape[1],
-                    use_cuda=use_cuda, relation_dim=relation_dim)
-        model.term_vecs.weight.data.copy_(
-            torch.from_numpy(frame.values)
-        )
-        return model
-        
 
     def reset_synonym_relation(self):
         """
@@ -455,7 +433,7 @@ class SemanticMatchingModel(nn.Module):
         with stopwatch(accumulator):
             print('Loading model from file {}.'.format(filename))
             frame = SemanticMatchingModel.load_initial_frame()
-            model = SemanticMatchingModel(frame.index)
+            model = SemanticMatchingModel(frame)
             # We have adopted the convention that models are moved to the
             # cpu before saving their state (as else loading would need
             # twice the gpu memory).  We (currently) do not support building
@@ -554,6 +532,12 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
     Returns:
         Total norm of the parameters (viewed as a single vector).
     """
+    # Torch sparse tensors may be stored un-coalesced (i.e., there can be
+    # more than one value assigned to each non-zero entry; the actual
+    # value of the tensor at that entry is the sum of those assigned values).
+    # Before computing the norm of a sparse tensor it must be coalesced, and
+    # after that it is only necessary to iterate over the non-zero entries to
+    # find the norm.
     parameters = list(filter(lambda p: p.grad is not None, parameters))
     max_norm = float(max_norm)
     norm_type = float(norm_type)
@@ -591,63 +575,103 @@ class DataParallelizedModule(nn.Module):
     Similarly to nn.DataParallel, this class of modules serves to wrap 
     other modules and run them in parallel over multiple gpus, splitting 
     training (or testing/application) batches between the gpus (over the 
-    first dimension of the batch).  
+    first dimension of the batch, which is assumed to correspond to data 
+    points within the batch).  
     
     Unlike nn.DataParallel, all of the wrapped module's parameters will be 
     copied to all gpus during construction of the wrapper, and only gradient 
     data will be copied from gpu to gpu during training (no data should need 
     to be copied between gpus during forward application).  However, training 
     should only use loss functions that can be expressed as averages over all 
-    data points of a batch of some per-data-point loss.  Also, the set of 
-    parameters of the wrapped module is assumed not to change (of course their 
-    values can change) over the lifetime of the wrapper object.
+    data points of a batch of some per-data-point loss.  Each training batch 
+    must be presented as a tuple of tensors all of which have equal sizes (or 
+    at least sizes in fixed proportions) in dimension 0 (corresponding to the 
+    points in the batch).  Also, the set of parameters of the wrapped module 
+    is assumed not to change (of course their values can change) over the 
+    lifetime of the wrapper object.
     
     Note that during training of a wrapped module, it is necessary to call 
     the wrapper's broadcast_gradients method immediately following the 
     backpropagation of gradients (i.e. typically right after calling 
     .backward on some loss tensor), in order to share corrections to the 
     computed gradients between the gpus.
+    
+    Specifically, if L is the average loss over an entire (mini-)batch, of 
+    size n data points, that batch is scattered over k gpus as chunks of 
+    sizes n_0, ..., n_(k-1) (with sum equal to n), and L_i is the average loss 
+    over the i-th chunk, then L = w_0 * L_0 + ... + w_k-1 * L_(k-1), where 
+    w_i = n_i / n, and so for any parameter p
+    
+        dL/dp = w_0 dL_0/dp + ... + w_(k-1) * dL_(k-1)/dp.
+    
+    The broadcast_gradients method collects the individual pieces of gradient 
+    data dL_i/dp from all the gpus, computes the unified gradient data dL/dp 
+    (for every parameter) and updates the gradients on every gpu.
     """
-    def __init__(self, module, device, copy_fn=None):
+    def __init__(self, module, device, copy_fn):
         """
         Construct a parallelizing wrapper for the given module (an instance 
         of nn.Module).  The module will be moved to the given device (if 
         not already there) and copies will be made using the given copy 
-        function (defaulting to copying the state dict) and placed on all other 
-        available gpus.
+        function (which should accept a module and a device, and return a 
+        copy of the module suitable for placement on that device) and 
+        moved to all other available gpus.
         """
         super().__init__()
 
-        # Set up a default copying function, which creates a new instance
-        # of the input's class and copies the state dict.
-        if copy_fn is None:
-            def copier(src):
-                result = type(src)()
-                result.cpu()
-                result.load_state_dict(src.state_dict())
-                return result
-            copy_fn = copier
+        # If the requested device is the cpu, or there is only one gpu,
+        # don't parallelize.
+        if device == torch.device('cpu') or not torch.cuda.is_available() \
+           or torch.cuda.device_count() < 2:
+            self.children = [module]
+            self.devices = [device]
+            module.to(device)
+            self.add_module('child:{0}', module)
+            self.chunk_sizes = torch.zeros(1, dtype=torch.int64)
+            return
         
         device_ids = list(range(torch.cuda.device_count()))
         devices = [torch.device('cuda:{}'.format(d_id)) for d_id in device_ids]
         if device not in devices:
             device = devices[0]
-        self.children = [module]
-        self.devices = [device]
+        self.children = [module] # put the original copy first
+        self.devices = [device] # the original copy will end up on this device
+
+        # Register the child as a submodule of the wrapper, so that the
+        # autograd machinery will update its parameters when the forward
+        # method of the wrapper is called.
         self.add_module('child:{}'.format(device.index), module)
+
+        # Save a list of all available devices (with the one corresponding to
+        # the original wrapped module first).
         for dev in devices:
             if dev != device:
                 self.devices.append(dev)
+
+        # Make a copy for each additional device, put it on the corresponding
+        # device, and register it as a submodule.
         for dev in self.devices[1:]:
-            module.cpu()
-            module_copy = copy_fn(module)
-            module_copy.to(dev)
-            module_copy.device = dev
+            module.cpu() # in case the copy_fn moved it
+            module_copy = copy_fn(module, dev)
+            module_copy.to(dev) # in case the copy_fn didn't move the copy
             self.children.append(module_copy)
             self.add_module('child:{}'.format(dev.index), module_copy)
+
+        # Put the original copy on the requested device.
         module.to(device)
-        module.device = device
+
+        # During forward evaluation of the wrapper it is necessary to keep
+        # track of the sizes of the chunks of the input batch(es) that are
+        # handed off to each child.  So we create a 1D tensor holding those
+        # sizes.
         self.chunk_sizes = torch.zeros(len(self.children), dtype=torch.int64)
+
+    @property
+    def device(self):
+        """
+        The nominal device of a parallelized module is the first device used.
+        """
+        return self.devices[0]
 
     def forward(self, *args):
         """
@@ -656,22 +680,48 @@ class DataParallelizedModule(nn.Module):
         tensors) back to the first gpu.  Also, accumulate the sizes of the 
         scattered chunks (for later use in updating parameter gradients).
         """
+        # Data is scattered into chunks by splitting on dimension 0.
+        split_dimension = 0
+
+        # We assume the input argument tensors have proportional sizes in
+        # the splitting dimension, so any of them can be used as representative
+        # of the size of the input batch, and it chunks as representative of
+        # the sizes of the chunks
+        representative = 0
+        
         if len(self.children) <= 1:
             return self.children[0](*args)
+        
         device_ids = [device.index for device in self.devices]
+
+        # Scatter each arg across the (multiple) devices.  For each arg,
+        # calling comm.scatter gives us a tuple of chunks, one chunk on each
+        # device.  We populate a list (with length equal to the number of
+        # devices) whose entries are lists (with length equal to the number
+        # of args) of the chunks on each device.
         chunk_lists = list(list() for i_device in device_ids)
         for arg in args:
             chunks = torch.cuda.comm.scatter(arg, device_ids)
             for i_child, chunk in enumerate(chunks):
                 chunk_lists[i_child].append(chunk)
+
+        # In order to apply the child modules to the appropriate collections
+        # of arg chunks, convert each list of chunks on one device to a tuple.
         chunks = list(tuple(chunk_list) for chunk_list in chunk_lists)
+
+        # Now we can apply the children modules to the chunks of data.  We
+        # collect the outputs in a list, and also update the running tally
+        # of the sizes of the chunks processed by each child.
         outputs = []
         for i_child, (module, chunk) in enumerate(zip(self.children, chunks)):
-            chunk_size = chunk[0].size()[0]
+            chunk_size = chunk[representative].size()[split_dimension]
             self.chunk_sizes[i_child] += chunk_size
             output = module(*chunk)
             outputs.append(output)
         assert len(self.children) == len(outputs)
+
+        # Finally, we put the separate outputs of the children together into
+        # a unified (concatenated) output, and place it on the first device.
         output = torch.cuda.comm.gather(
             outputs, destination=self.devices[0].index)
         return output
@@ -688,26 +738,35 @@ class DataParallelizedModule(nn.Module):
         """
         Compute a single value, for all the child modules, of the gradient 
         of each module parameter (as a convex combination of the gradients 
-        in the individual children, with coefficients based on the batch 
-        sizes from the forward computation), and distribute these common 
-        gradients back to all the children.
+        in the individual children, with coefficients proportional to the 
+        batch chunk sizes from the forward computation), and distribute these 
+        common gradients back to all the children.
         """
         if len(self.children) <= 1:
             return
+
+        # Compute the coefficients of the convex combination, proportional to
+        # the sizes of the chunks of the batch that were processed by each
+        # child.
         weights = self.chunk_sizes.to(torch.float32) / \
                   self.chunk_sizes.sum().to(torch.float32)
-        weights = [weights[i_device].item() for i_device, device in
-                   enumerate(self.devices)]
+        weights = [weights[i_device].item() for i_device, device in enumerate(self.devices)]
+
+        # Update each parameter's gradients on all children.
         for name, param in self.children[0].named_parameters():
             if param.grad is None:
                 continue
             param_copies = [param]
+
+            # Collect the other children's copies of this parameter in a list.
             for other_module in self.children[1:]:
+                # Find the other module's parameter of the same name.
                 other_module_params = list(
                     p for other_name, p in other_module.named_parameters()
                     if other_name == name)
                 assert len(other_module_params) == 1
                 param_copies.append(other_module_params[0])
+            
             # Find the sum, over all child modules, of the gradient for this
             # parameter in the child, multiplied by the corresponding weights
             # (as determined above by the relative sizes of the batch chunks
@@ -716,10 +775,41 @@ class DataParallelizedModule(nn.Module):
                 list(param_copy.grad.mul_(weight) for param_copy, weight in
                      zip(param_copies, weights)), 
                 destination=self.devices[0].index)
+            
             # Now send the weighted sum to all the child modules on their
-            # devices.
+            # devices, replacing their values of the parameter's gradient.
             for i_param_copy, param_copy in enumerate(param_copies):
                 param_copy.grad = param_grad.to(self.devices[i_param_copy])
+
+    def synchronize_children(self, tolerance=5e-6):
+        """
+        In principle, if broadcast_gradients is called on every training step, 
+        the child modules should always agree on all parameters.  In practice, 
+        some optimizers sometimes introduce slight discrepancies (e.g. 
+        optim.SGD with sparse gradients, which does not coalesce such gradients 
+        at every step).  This method can be called periodically to reset the 
+        parameters of all children to the values of the first child (the 
+        original module), and to print warnings if the parameters have diverged 
+        by more than the given (absolute) tolerance.
+        """
+        msg = 'Warning: {} differs between parallelized models by {}.'
+        model = self.children[0]
+        for child, device in zip(self.children[1:], self.devices[1:]):
+            for name, param in model.named_parameters():
+                param_data_cpu = param.data.cpu()
+                # Find the param on the child of the same name.
+                child_params = list(
+                    p for other_name, p in child.named_parameters()
+                    if name == other_name)
+                assert len(child_params) == 1
+                # Find its difference from the param on the first child.
+                difference = torch.norm(
+                    param_data_cpu - child_params[0].data.cpu())
+                if difference > tolerance:
+                    print(msg.format(name, difference))
+                # Copy the param to the child (but first free up space).
+                child_params[0].data = child_params[0].data.new_empty((0,))
+                child_params[0].data = param_data_cpu.to(device)
 
 
 
@@ -733,17 +823,17 @@ def train_model(model, dataset):
     """
     model.train()
     
-    def model_copier(model):
+    def model_copier(model, device):
         model.cpu()
-        new_model = SemanticMatchingModel(model.index, use_cuda=False)
+        frame = pd.DataFrame(model.term_vecs.weight.data.numpy(),
+                             index=model.index)
+        new_model = SemanticMatchingModel(frame, use_cuda=False)
         new_model.load_state_dict(model.state_dict())
+        new_model.device = device
+        new_model.to(device)
         return new_model
 
-    if model.device != torch.device('cpu'):
-        parallel_model = DataParallelizedModule(
-            model, model.device, copy_fn=model_copier)
-    else:
-        parallel_model = model
+    parallel_model = DataParallelizedModule(model, model.device, copy_fn=model_copier)
         
     # Relative loss says that the positive examples should outrank their
     # corresponding negative examples, with a difference of at least 1
@@ -760,9 +850,9 @@ def train_model(model, dataset):
     optimizer = optim.SGD(parallel_model.parameters(), lr=0.1)
     losses = []
     true_target = torch.ones([BATCH_SIZE], dtype=torch.float32,
-                             device=model.device)
+                             device=parallel_model.device)
     false_target = torch.zeros([BATCH_SIZE], dtype=torch.float32,
-                               device=model.device)
+                               device=parallel_model.device)
     steps = 0
 
     # Note that you want drop_last=False with a CyclingSampler.
@@ -772,15 +862,17 @@ def train_model(model, dataset):
                              sampler=CyclingSampler(dataset),
                              pin_memory=True)
     for pos_batch, neg_batch, weights in data_loader:
-        if model.device != torch.device('cpu'):
+        if parallel_model.device != torch.device('cpu'):
             pos_batch = tuple(
-                x.cuda(device=model.device, non_blocking=True)
+                x.cuda(device=parallel_model.device, non_blocking=True)
                 for x in pos_batch)
             neg_batch = tuple(
-                x.cuda(device=model.device, non_blocking=True)
+                x.cuda(device=parallel_model.device, non_blocking=True)
                 for x in neg_batch)
-            weights = weights.cuda(device=model.device, non_blocking=True)
+            weights = weights.cuda(device=parallel_model.device, non_blocking=True)
+        
         parallel_model.zero_grad()
+        
         pos_energy = parallel_model(*pos_batch)
         neg_energy = parallel_model(*neg_batch)
         
@@ -794,20 +886,14 @@ def train_model(model, dataset):
         loss = abs_loss + rel_loss
         loss.backward()
 
-        if model != parallel_model:
-            parallel_model.broadcast_gradients()
-            for model_copy in parallel_model.children:
-                clip_grad_norm(model_copy.parameters(), 1)
-        else:
-            clip_grad_norm(model.parameters(), 1)
+        parallel_model.broadcast_gradients()
+        for model_copy in parallel_model.children:
+            clip_grad_norm(model_copy.parameters(), 1)
         
         optimizer.step()
         
-        if model == parallel_model:
-            model.reset_synonym_relation()
-        else:
-            for model_copy in parallel_model.children:
-                model_copy.reset_synonym_relation()
+        for model_copy in parallel_model.children:
+            model_copy.reset_synonym_relation()
 
         losses.append(loss.data.cpu().item())
         steps += 1
@@ -826,28 +912,15 @@ def train_model(model, dataset):
             torch.save(model.state_dict(), MODEL_FILENAME)
             model.to(model.device)
             print("saved")
+
+            # With optim.SGD as the optimizer and when the model is
+            # parallelized across multiple GPU's we see slight divergences
+            # over time between the parallel models.  (This did not happen
+            # with a custom optimizer that coalesces sparse gradients at
+            # every training iteration.)  So we force agreement between the
+            # children periodically.
             
-            # Sanity check:  if the model has been parallelized across
-            # multiple gpu's, the parameters across all gpu's should agree.
-            # But in practice we see some drift when using optim.SGD with
-            # sparse gradients (evidently related to insufficiently frequent
-            # coalescing of sparse tensors, since this issue went away in
-            # a branch in which optim.SGD was replaced with custom code that
-            # coalesced sparse gradients on every optimization step).  So
-            # we synchronize the parameters periodically.
-            
-            if model != parallel_model:
-                for child in parallel_model.children:
-                    for name, param in model.named_parameters():
-                        child_params = list(
-                            p for other_name, p in child.named_parameters()
-                            if name == other_name)
-                        assert len(child_params) == 1
-                        difference = torch.norm(
-                            param.data.cpu() - child_params[0].data.cpu())
-                        if difference > 5e-6:
-                            print('Warning: {} differs between parallelized models by {}'.format(name, difference))
-                        child_params[0].data = param.data.to(child.device)
+            parallel_model.synchronize_children()
         
     print()
 
@@ -862,7 +935,7 @@ def get_model():
         model = SemanticMatchingModel.load_model(MODEL_FILENAME)
     else:
         frame = SemanticMatchingModel.load_initial_frame()
-        model = SemanticMatchingModel.from_frame(l2_normalize_rows(frame))
+        model = SemanticMatchingModel(l2_normalize_rows(frame))
     return model
 
 
