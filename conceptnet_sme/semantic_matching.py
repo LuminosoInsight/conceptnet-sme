@@ -1,6 +1,7 @@
 import torch
+
 try:
-    torch.multiprocessing.set_start_method('spawn')
+    torch.multiprocessing.set_start_method("spawn")
 except RuntimeError:
     pass
 import torch.autograd as autograd
@@ -19,7 +20,10 @@ import contextlib
 import time
 
 from conceptnet_sme.relations import (
-    COMMON_RELATIONS, ALL_RELATIONS, SYMMETRIC_RELATIONS, ENTAILED_RELATIONS,
+    COMMON_RELATIONS,
+    ALL_RELATIONS,
+    SYMMETRIC_RELATIONS,
+    ENTAILED_RELATIONS,
 )
 from conceptnet5.uri import uri_prefix, assertion_uri, get_uri_language
 from conceptnet5.util import get_data_filename
@@ -29,13 +33,29 @@ from conceptnet5.vectors.transforms import l2_normalize_rows
 
 RELATION_INDEX = pd.Index(COMMON_RELATIONS)
 N_RELS = len(RELATION_INDEX)
-INITIAL_VECS_FILENAME = get_data_filename('vectors/numberbatch-biased.h5')
-EDGES_FILENAME = get_data_filename('collated/sorted/edges-shuf.csv')
-MODEL_FILENAME = get_data_filename('sme/sme.model')
+INITIAL_VECS_FILENAME = get_data_filename("vectors/numberbatch-biased.h5")
+EDGES_FILENAME = get_data_filename("collated/sorted/edges-shuf.csv")
+MODEL_FILENAME = get_data_filename("sme/sme.model")
 NEG_SAMPLES = 5
 LANGUAGES_TO_USE = [
-    'en', 'fr', 'de', 'it', 'es', 'ru', 'pt', 'ja', 'zh', 'nl',
-    'ar', 'fa', 'ko', 'ms', 'no', 'pl', 'sv', 'mul'
+    "en",
+    "fr",
+    "de",
+    "it",
+    "es",
+    "ru",
+    "pt",
+    "ja",
+    "zh",
+    "nl",
+    "ar",
+    "fa",
+    "ko",
+    "ms",
+    "no",
+    "pl",
+    "sv",
+    "mul",
 ]
 BATCH_SIZE = 160
 
@@ -66,12 +86,10 @@ def _make_rel_chart():
             entailed_rel = ENTAILED_RELATIONS[entailed_rel]
             entailed.append(entailed_rel)
         entailed_map[rel] = [
-            i for (i, rel) in enumerate(COMMON_RELATIONS)
-            if rel in entailed
+            i for (i, rel) in enumerate(COMMON_RELATIONS) if rel in entailed
         ]
         unrelated_map[rel] = [
-            i for (i, rel) in enumerate(COMMON_RELATIONS)
-            if rel not in entailed
+            i for (i, rel) in enumerate(COMMON_RELATIONS) if rel not in entailed
         ]
     return entailed_map, unrelated_map
 
@@ -81,10 +99,10 @@ ENTAILED_INDICES, UNRELATED_INDICES = _make_rel_chart()
 
 @contextlib.contextmanager
 def stopwatch(consumer):
-    '''
+    """
     After executing the managed block of code, call the provided consumer with 
     two arguments, the start and end times of the execution of the block.
-    '''
+    """
     start_time = time.perf_counter()
     yield
     end_time = time.perf_counter()
@@ -92,36 +110,41 @@ def stopwatch(consumer):
         consumer(start_time, end_time)
     return
 
+
 class TimeAccumulator:
-    '''
+    """
     A simple consumer for use with stopwatches, that accumulates the total 
     elapsed time over multiple calls, and has a convenience method for printing 
     the total time (and optionally resetting it).
-    '''
+    """
+
     def __init__(self, initial_time=0.0):
         self.accumulated_time = initial_time
         return
+
     def __call__(self, start_time, end_time):
         self.accumulated_time += end_time - start_time
         return
+
     def print(self, caption, accumulated_time=None):
-        print('{} {} sec.'.format(caption, self.accumulated_time))
+        print("{} {} sec.".format(caption, self.accumulated_time))
         if accumulated_time is not None:
             self.accumulated_time = accumulated_time
         return
 
 
 class EdgeDataset(Dataset):
-    '''
+    """
     Wrapper class (around an iteration over ConceptNet edges) that enables us 
     to use a torch DataLoader to parallelize generation of training batches.
-    '''
+    """
+
     def __init__(self, filename, index):
-        '''
+        """
         Construct an edge dataset from a filename (of a tab-separated 
         ConceptNet edge file, which should be in random order), and a (pandas) 
         index mapping (row) numbers to terms of the ConceptNet vocabulary. 
-        '''
+        """
         super().__init__()
         self.filename = filename
         self.index = index
@@ -132,10 +155,9 @@ class EdgeDataset(Dataset):
         left_indices = []
         right_indices = []
         weights = []
-        for count, (rel, left, right, weight) in \
-          enumerate(self.iter_edges_once()):
+        for count, (rel, left, right, weight) in enumerate(self.iter_edges_once()):
             if count % 1000000 == 0:
-                print('Read {} edges.'.format(count))
+                print("Read {} edges.".format(count))
             if rel not in COMMON_RELATIONS:
                 continue
             if not ENTAILED_INDICES[rel]:
@@ -153,7 +175,7 @@ class EdgeDataset(Dataset):
             right_indices.append(right_idx)
             weights.append(weight)
         if len(rel_indices) < 1:
-            print('No edges survived filtering; fitting is impossible!')
+            print("No edges survived filtering; fitting is impossible!")
             raise ValueError
         self.rel_indices = torch.LongTensor(rel_indices)
         self.left_indices = torch.LongTensor(left_indices)
@@ -163,44 +185,43 @@ class EdgeDataset(Dataset):
 
     def __len__(self):
         return len(self.rel_indices)
-    
+
     def iter_edges_once(self):
-        '''Return the edges from the data file.'''
-        with open(self.filename, encoding='utf-8') as fp:
+        """Return the edges from the data file."""
+        with open(self.filename, encoding="utf-8") as fp:
             for line in fp:
-                _assertion, relation, concept1, concept2, _rest = \
-                    line.split('\t', 4)
+                _assertion, relation, concept1, concept2, _rest = line.split("\t", 4)
                 yield (relation, concept1, concept2, 1.)
         return
 
     def __getitem__(self, i_edge):
-        '''
+        """
         Produce a positive example and weight and a batch of (of size 
         NEG_SAMPLES) of negative examples, derived from the edge at the 
         given index.  The return values are three torch tensors containing 
         the positive example, the negative examples, and the weights.
-        '''
+        """
         rel_idx = self.rel_indices[i_edge]
         left_idx = self.left_indices[i_edge]
         right_idx = self.right_indices[i_edge]
         weight = self.edge_weights[i_edge]
-        
+
         rel = RELATION_INDEX[rel_idx]
-        
+
         # Possibly swap the sides of a relation
         if coin_flip() and rel in SYMMETRIC_RELATIONS:
             left_idx, right_idx = right_idx, left_idx
-        
+
         # Possibly replace a relation with a more general relation
         if coin_flip():
             rel_idx = random.choice(ENTAILED_INDICES[rel])
             rel = COMMON_RELATIONS[rel_idx]
-        
+
         pos_rels = [rel_idx]
         pos_left = [left_idx]
-        pos_right= [right_idx]
+        pos_right = [right_idx]
         weights = [weight]
-        
+
         neg_rels = []
         neg_left = []
         neg_right = []
@@ -209,7 +230,7 @@ class EdgeDataset(Dataset):
             corrupt_rel_idx = rel_idx
             corrupt_left_idx = left_idx
             corrupt_right_idx = right_idx
-            
+
             corrupt_which = random.randrange(5)
             if corrupt_which == 0:
                 if rel not in SYMMETRIC_RELATIONS and coin_flip():
@@ -228,59 +249,65 @@ class EdgeDataset(Dataset):
             neg_left.append(corrupt_left_idx)
             neg_right.append(corrupt_right_idx)
 
-        pos_data = dict(rel=torch.LongTensor(pos_rels),
-                        left=torch.LongTensor(pos_left),
-                        right=torch.LongTensor(pos_right))
-        neg_data = dict(rel=torch.LongTensor(neg_rels),
-                        left=torch.LongTensor(neg_left),
-                        right=torch.LongTensor(neg_right))
+        pos_data = dict(
+            rel=torch.LongTensor(pos_rels),
+            left=torch.LongTensor(pos_left),
+            right=torch.LongTensor(pos_right),
+        )
+        neg_data = dict(
+            rel=torch.LongTensor(neg_rels),
+            left=torch.LongTensor(neg_left),
+            right=torch.LongTensor(neg_right),
+        )
         weights = torch.FloatTensor(weights)
-        return dict(positive_data=pos_data,
-                    negative_data=neg_data,
-                    weights=weights)
+        return dict(positive_data=pos_data, negative_data=neg_data, weights=weights)
 
     def collate_batch(self, batch):
-        '''
+        """
         Collates batches (as returned by a DataLoader that batches 
         the outputs of calls to __getitem__) into tensors (as required 
         by the train method of SemanticMatchingModel).
-        '''
-        pos_rels = torch.cat(list(x['positive_data']['rel'] for x in batch))
-        pos_left = torch.cat(list(x['positive_data']['left'] for x in batch))
-        pos_right = torch.cat(list(x['positive_data']['right'] for x in batch))
-        neg_rels = torch.cat(list(x['negative_data']['rel'] for x in batch))
-        neg_left = torch.cat(list(x['negative_data']['left'] for x in batch))
-        neg_right = torch.cat(list(x['negative_data']['right'] for x in batch))
-        weights = torch.cat(list(x['weights'] for x in batch))
+        """
+        pos_rels = torch.cat(list(x["positive_data"]["rel"] for x in batch))
+        pos_left = torch.cat(list(x["positive_data"]["left"] for x in batch))
+        pos_right = torch.cat(list(x["positive_data"]["right"] for x in batch))
+        neg_rels = torch.cat(list(x["negative_data"]["rel"] for x in batch))
+        neg_left = torch.cat(list(x["negative_data"]["left"] for x in batch))
+        neg_right = torch.cat(list(x["negative_data"]["right"] for x in batch))
+        weights = torch.cat(list(x["weights"] for x in batch))
         pos_data = (pos_rels, pos_left, pos_right)
         neg_data = (neg_rels, neg_left, neg_right)
         return pos_data, neg_data, weights
 
 
 class CyclingSampler(Sampler):
-    '''
+    """
     Like a sequential sampler, but these samplers cycle repeatedly over the 
     data source, and so have infinite length.
-    '''
+    """
+
     def __init__(self, data_source):
         self.data_source = data_source
         self.index = 0
         return
+
     def _next_index(self):
         result = self.index
         self.index = (self.index + 1) % len(self.data_source)
         return result
-    def __iter__(self):
-        return iter(self._next_index, None) # never raises StopIteration!
-    def __len__(self):
-        return -1 # what else can we do?
 
+    def __iter__(self):
+        return iter(self._next_index, None)  # never raises StopIteration!
+
+    def __len__(self):
+        return -1  # what else can we do?
 
 
 class SemanticMatchingModel(nn.Module):
     """
     The PyTorch model for semantic matching energy over ConceptNet.
     """
+
     def __init__(self, frame, use_cuda=True, term_dim=300, relation_dim=10):
         """
         Parameters:
@@ -314,33 +341,33 @@ class SemanticMatchingModel(nn.Module):
         # PyTorch convention is that inputs come before outputs, but the
         # resulting tensor is (k_2 x k_1 x k_1) because the math convention
         # is that outputs are on the left.
-        self.assoc_tensor = nn.Bilinear(
-            term_dim, term_dim, relation_dim, bias=True
-        )
+        self.assoc_tensor = nn.Bilinear(term_dim, term_dim, relation_dim, bias=True)
         self.rel_vecs = nn.Embedding(N_RELS, relation_dim, sparse=True)
 
         # Using CUDA to run on the GPU requires different data types
         if use_cuda and torch.cuda.is_available():
-            self.device = torch.device('cuda:0')
+            self.device = torch.device("cuda:0")
         else:
-            self.device = torch.device('cpu')
+            self.device = torch.device("cpu")
 
-        self.register_buffer('identity_slice', 
-                             torch.tensor(np.eye(term_dim),
-                                          dtype=torch.float32,
-                                          device=self.device))
+        self.register_buffer(
+            "identity_slice",
+            torch.tensor(np.eye(term_dim), dtype=torch.float32, device=self.device),
+        )
         self.reset_synonym_relation()
 
         # Learnable priors for how confident to be in arbitrary statements.
         # These are used to convert the tensor products linearly into logits.
         # The initial values of these are set to numbers that appeared
         # reasonable based on a previous run.
-        self.truth_multiplier = nn.Parameter(torch.tensor(
-            5.0, dtype=torch.float32, device=self.device))
-        self.truth_offset = nn.Parameter(torch.tensor(
-            -3.0, dtype=torch.float32, device=self.device))
+        self.truth_multiplier = nn.Parameter(
+            torch.tensor(5.0, dtype=torch.float32, device=self.device)
+        )
+        self.truth_offset = nn.Parameter(
+            torch.tensor(-3.0, dtype=torch.float32, device=self.device)
+        )
 
-        self.to(self.device) # make sure everything is on the right device
+        self.to(self.device)  # make sure everything is on the right device
 
     def reset_synonym_relation(self):
         """
@@ -414,14 +441,15 @@ class SemanticMatchingModel(nn.Module):
         """
         accumulator = TimeAccumulator()
         with stopwatch(accumulator):
-            print('Loading frame from file {}.'.format(INITIAL_VECS_FILENAME))
+            print("Loading frame from file {}.".format(INITIAL_VECS_FILENAME))
             frame = load_hdf(INITIAL_VECS_FILENAME)
             labels = [
-                label for label in frame.index
+                label
+                for label in frame.index
                 if get_uri_language(label) in LANGUAGES_TO_USE
             ]
             frame = frame.loc[labels]
-        accumulator.print('Loading frame took')
+        accumulator.print("Loading frame took")
         return frame.astype(np.float32)
 
     @staticmethod
@@ -431,7 +459,7 @@ class SemanticMatchingModel(nn.Module):
         """
         accumulator = TimeAccumulator()
         with stopwatch(accumulator):
-            print('Loading model from file {}.'.format(filename))
+            print("Loading model from file {}.".format(filename))
             frame = SemanticMatchingModel.load_initial_frame()
             model = SemanticMatchingModel(frame)
             # We have adopted the convention that models are moved to the
@@ -441,20 +469,19 @@ class SemanticMatchingModel(nn.Module):
             model.cpu()
             model.load_state_dict(torch.load(filename))
             model.to(model.device)
-        accumulator.print('Total time to load model:')
+        accumulator.print("Total time to load model:")
         return model
 
-    def evaluate_conceptnet(self, dataset, cutoff_value=-1,
-                            output_filename=None):
+    def evaluate_conceptnet(self, dataset, cutoff_value=-1, output_filename=None):
         """
         Use the SME model to "sanity-check" existing edges in ConceptNet.
         We particularly highlight edges that get a value of -1 or less, which
         may be bad or unhelpful edges.
         """
-        self.eval() # in case someday we add submodules where the mode matters
-            
+        self.eval()  # in case someday we add submodules where the mode matters
+
         if output_filename:
-            out = open(output_filename, 'w', encoding='utf-8')
+            out = open(output_filename, "w", encoding="utf-8")
         else:
             out = None
         for rel, left, right, weight in dataset.iter_edges_once():
@@ -465,15 +492,16 @@ class SemanticMatchingModel(nn.Module):
             except KeyError:
                 continue
 
-            rel_tensor = torch.tensor([rel_idx], dtype=torch.int64,
-                                      device=self.device)
-            left_tensor = torch.tensor([left_idx], dtype=torch.int64,
-                                       device=self.device)
-            right_tensor = torch.tensor([right_idx], dtype=torch.int64,
-                                        device=self.device)
+            rel_tensor = torch.tensor([rel_idx], dtype=torch.int64, device=self.device)
+            left_tensor = torch.tensor(
+                [left_idx], dtype=torch.int64, device=self.device
+            )
+            right_tensor = torch.tensor(
+                [right_idx], dtype=torch.int64, device=self.device
+            )
 
             model_output = self(rel_tensor, left_tensor, right_tensor)
- 
+
             value = model_output.item()
             assertion = assertion_uri(rel, left, right)
             if value < cutoff_value:
@@ -508,11 +536,10 @@ class SemanticMatchingModel(nn.Module):
         # /r/RelatedTo. Our goal is to distinguish similarity from relatedness,
         # such as for the SimLex evaluation.
         rel_vec = rel_mat[1]
-        related_mat = np.einsum('i,ijk->jk', rel_vec, assoc_t)
+        related_mat = np.einsum("i,ijk->jk", rel_vec, assoc_t)
         related_mat = (related_mat + related_mat.T) / 2
         related_terms = term_frame.dot(related_mat)
         save_hdf(related_terms, str(path / "terms-related.h5"))
-
 
 
 def clip_grad_norm(parameters, max_norm, norm_type=2):
@@ -541,7 +568,8 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
     parameters = list(filter(lambda p: p.grad is not None, parameters))
     max_norm = float(max_norm)
     norm_type = float(norm_type)
-    if norm_type == float('inf'):
+    if norm_type == float("inf"):
+
         def L_inf_norm(tensor):
             if tensor.layout == torch.sparse_coo:
                 if tensor._nnz() > 0:
@@ -550,6 +578,7 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
                     return 0.0
             else:
                 return tensor.abs().max()
+
         total_norm = max(L_inf_norm(p.grad.data) for p in parameters)
     else:
         total_norm = 0
@@ -567,7 +596,6 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
             if p.grad.data.layout == torch.sparse_coo:
                 p.grad.data = p.grad.data.coalesce()
     return total_norm
-
 
 
 class DataParallelizedModule(nn.Module):
@@ -608,6 +636,7 @@ class DataParallelizedModule(nn.Module):
     data dL_i/dp from all the gpus, computes the unified gradient data dL/dp 
     (for every parameter) and updates the gradients on every gpu.
     """
+
     def __init__(self, module, device, copy_fn):
         """
         Construct a parallelizing wrapper for the given module (an instance 
@@ -621,26 +650,29 @@ class DataParallelizedModule(nn.Module):
 
         # If the requested device is the cpu, or there is only one gpu,
         # don't parallelize.
-        if device == torch.device('cpu') or not torch.cuda.is_available() \
-           or torch.cuda.device_count() < 2:
+        if (
+            device == torch.device("cpu")
+            or not torch.cuda.is_available()
+            or torch.cuda.device_count() < 2
+        ):
             self.children = [module]
             self.devices = [device]
             module.to(device)
-            self.add_module('child:{0}', module)
+            self.add_module("child:{0}", module)
             self.chunk_sizes = torch.zeros(1, dtype=torch.int64)
             return
-        
+
         device_ids = list(range(torch.cuda.device_count()))
-        devices = [torch.device('cuda:{}'.format(d_id)) for d_id in device_ids]
+        devices = [torch.device("cuda:{}".format(d_id)) for d_id in device_ids]
         if device not in devices:
             device = devices[0]
-        self.children = [module] # put the original copy first
-        self.devices = [device] # the original copy will end up on this device
+        self.children = [module]  # put the original copy first
+        self.devices = [device]  # the original copy will end up on this device
 
         # Register the child as a submodule of the wrapper, so that the
         # autograd machinery will update its parameters when the forward
         # method of the wrapper is called.
-        self.add_module('child:{}'.format(device.index), module)
+        self.add_module("child:{}".format(device.index), module)
 
         # Save a list of all available devices (with the one corresponding to
         # the original wrapped module first).
@@ -651,11 +683,11 @@ class DataParallelizedModule(nn.Module):
         # Make a copy for each additional device, put it on the corresponding
         # device, and register it as a submodule.
         for dev in self.devices[1:]:
-            module.cpu() # in case the copy_fn moved it
+            module.cpu()  # in case the copy_fn moved it
             module_copy = copy_fn(module, dev)
-            module_copy.to(dev) # in case the copy_fn didn't move the copy
+            module_copy.to(dev)  # in case the copy_fn didn't move the copy
             self.children.append(module_copy)
-            self.add_module('child:{}'.format(dev.index), module_copy)
+            self.add_module("child:{}".format(dev.index), module_copy)
 
         # Put the original copy on the requested device.
         module.to(device)
@@ -688,10 +720,10 @@ class DataParallelizedModule(nn.Module):
         # of the size of the input batch, and it chunks as representative of
         # the sizes of the chunks
         representative = 0
-        
+
         if len(self.children) <= 1:
             return self.children[0](*args)
-        
+
         device_ids = [device.index for device in self.devices]
 
         # Scatter each arg across the (multiple) devices.  For each arg,
@@ -722,8 +754,7 @@ class DataParallelizedModule(nn.Module):
 
         # Finally, we put the separate outputs of the children together into
         # a unified (concatenated) output, and place it on the first device.
-        output = torch.cuda.comm.gather(
-            outputs, destination=self.devices[0].index)
+        output = torch.cuda.comm.gather(outputs, destination=self.devices[0].index)
         return output
 
     def zero_grad(self):
@@ -748,9 +779,12 @@ class DataParallelizedModule(nn.Module):
         # Compute the coefficients of the convex combination, proportional to
         # the sizes of the chunks of the batch that were processed by each
         # child.
-        weights = self.chunk_sizes.to(torch.float32) / \
-                  self.chunk_sizes.sum().to(torch.float32)
-        weights = [weights[i_device].item() for i_device, device in enumerate(self.devices)]
+        weights = self.chunk_sizes.to(torch.float32) / self.chunk_sizes.sum().to(
+            torch.float32
+        )
+        weights = [
+            weights[i_device].item() for i_device, device in enumerate(self.devices)
+        ]
 
         # Update each parameter's gradients on all children.
         for name, param in self.children[0].named_parameters():
@@ -762,20 +796,25 @@ class DataParallelizedModule(nn.Module):
             for other_module in self.children[1:]:
                 # Find the other module's parameter of the same name.
                 other_module_params = list(
-                    p for other_name, p in other_module.named_parameters()
-                    if other_name == name)
+                    p
+                    for other_name, p in other_module.named_parameters()
+                    if other_name == name
+                )
                 assert len(other_module_params) == 1
                 param_copies.append(other_module_params[0])
-            
+
             # Find the sum, over all child modules, of the gradient for this
             # parameter in the child, multiplied by the corresponding weights
             # (as determined above by the relative sizes of the batch chunks
             # processed by each child), and place it on the first device.
             param_grad = torch.cuda.comm.reduce_add(
-                list(param_copy.grad.mul_(weight) for param_copy, weight in
-                     zip(param_copies, weights)), 
-                destination=self.devices[0].index)
-            
+                list(
+                    param_copy.grad.mul_(weight)
+                    for param_copy, weight in zip(param_copies, weights)
+                ),
+                destination=self.devices[0].index,
+            )
+
             # Now send the weighted sum to all the child modules on their
             # devices, replacing their values of the parameter's gradient.
             for i_param_copy, param_copy in enumerate(param_copies):
@@ -792,25 +831,25 @@ class DataParallelizedModule(nn.Module):
         original module), and to print warnings if the parameters have diverged 
         by more than the given (absolute) tolerance.
         """
-        msg = 'Warning: {} differs between parallelized models by {}.'
+        msg = "Warning: {} differs between parallelized models by {}."
         model = self.children[0]
         for child, device in zip(self.children[1:], self.devices[1:]):
             for name, param in model.named_parameters():
                 param_data_cpu = param.data.cpu()
                 # Find the param on the child of the same name.
                 child_params = list(
-                    p for other_name, p in child.named_parameters()
-                    if name == other_name)
+                    p
+                    for other_name, p in child.named_parameters()
+                    if name == other_name
+                )
                 assert len(child_params) == 1
                 # Find its difference from the param on the first child.
-                difference = torch.norm(
-                    param_data_cpu - child_params[0].data.cpu())
+                difference = torch.norm(param_data_cpu - child_params[0].data.cpu())
                 if difference > tolerance:
                     print(msg.format(name, difference))
                 # Copy the param to the child (but first free up space).
                 child_params[0].data = child_params[0].data.new_empty((0,))
                 child_params[0].data = param_data_cpu.to(device)
-
 
 
 def train_model(model, dataset):
@@ -822,11 +861,10 @@ def train_model(model, dataset):
     long as you want.
     """
     model.train()
-    
+
     def model_copier(model, device):
         model.cpu()
-        frame = pd.DataFrame(model.term_vecs.weight.data.numpy(),
-                             index=model.index)
+        frame = pd.DataFrame(model.term_vecs.weight.data.numpy(), index=model.index)
         new_model = SemanticMatchingModel(frame, use_cuda=False)
         new_model.load_state_dict(model.state_dict())
         new_model.device = device
@@ -834,7 +872,7 @@ def train_model(model, dataset):
         return new_model
 
     parallel_model = DataParallelizedModule(model, model.device, copy_fn=model_copier)
-        
+
     # Relative loss says that the positive examples should outrank their
     # corresponding negative examples, with a difference of at least 1
     # logit between them. If the difference is less than this (especially
@@ -849,38 +887,48 @@ def train_model(model, dataset):
 
     optimizer = optim.SGD(parallel_model.parameters(), lr=0.1)
     losses = []
-    true_target = torch.ones([BATCH_SIZE], dtype=torch.float32,
-                             device=parallel_model.device)
-    false_target = torch.zeros([BATCH_SIZE], dtype=torch.float32,
-                               device=parallel_model.device)
+    true_target = torch.ones(
+        [BATCH_SIZE], dtype=torch.float32, device=parallel_model.device
+    )
+    false_target = torch.zeros(
+        [BATCH_SIZE], dtype=torch.float32, device=parallel_model.device
+    )
     steps = 0
 
     # Note that you want drop_last=False with a CyclingSampler.
-    data_loader = DataLoader(dataset, batch_size=BATCH_SIZE,
-                             drop_last=False, num_workers=10,
-                             collate_fn=dataset.collate_batch,
-                             sampler=CyclingSampler(dataset),
-                             pin_memory=True)
+    data_loader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        drop_last=False,
+        num_workers=10,
+        collate_fn=dataset.collate_batch,
+        sampler=CyclingSampler(dataset),
+        pin_memory=True,
+    )
     for pos_batch, neg_batch, weights in data_loader:
-        if parallel_model.device != torch.device('cpu'):
+        if parallel_model.device != torch.device("cpu"):
             pos_batch = tuple(
                 x.cuda(device=parallel_model.device, non_blocking=True)
-                for x in pos_batch)
+                for x in pos_batch
+            )
             neg_batch = tuple(
                 x.cuda(device=parallel_model.device, non_blocking=True)
-                for x in neg_batch)
+                for x in neg_batch
+            )
             weights = weights.cuda(device=parallel_model.device, non_blocking=True)
-        
+
         parallel_model.zero_grad()
-        
+
         pos_energy = parallel_model(*pos_batch)
         neg_energy = parallel_model(*neg_batch)
-        
+
         abs_loss = absolute_loss_function(pos_energy, true_target)
         rel_loss = 0
         for neg_index in range(NEG_SAMPLES):
             neg_energy_slice = neg_energy[neg_index::NEG_SAMPLES]
-            rel_loss += relative_loss_function(pos_energy, neg_energy_slice, true_target)
+            rel_loss += relative_loss_function(
+                pos_energy, neg_energy_slice, true_target
+            )
             abs_loss += absolute_loss_function(neg_energy_slice, false_target)
 
         loss = abs_loss + rel_loss
@@ -889,9 +937,9 @@ def train_model(model, dataset):
         parallel_model.broadcast_gradients()
         for model_copy in parallel_model.children:
             clip_grad_norm(model_copy.parameters(), 1)
-        
+
         optimizer.step()
-        
+
         for model_copy in parallel_model.children:
             model_copy.reset_synonym_relation()
 
@@ -902,9 +950,10 @@ def train_model(model, dataset):
             model.show_debug(neg_batch, neg_energy, False)
             model.show_debug(pos_batch, pos_energy, True)
             avg_loss = np.mean(losses)
-            print("%d steps, loss=%4.4f, abs=%4.4f, rel=%4.4f" % (
-                steps, avg_loss, abs_loss, rel_loss
-            ))
+            print(
+                "%d steps, loss=%4.4f, abs=%4.4f, rel=%4.4f"
+                % (steps, avg_loss, abs_loss, rel_loss)
+            )
             losses.clear()
 
         if steps % 5000 == 0:
@@ -919,11 +968,10 @@ def train_model(model, dataset):
             # with a custom optimizer that coalesces sparse gradients at
             # every training iteration.)  So we force agreement between the
             # children periodically.
-            
-            parallel_model.synchronize_children()
-        
-    print()
 
+            parallel_model.synchronize_children()
+
+    print()
 
 
 def get_model():
@@ -939,13 +987,13 @@ def get_model():
     return model
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     model = get_model()
-    print('Initializing edge dataset ....')
+    print("Initializing edge dataset ....")
     dataset_accumulator = TimeAccumulator()
     with stopwatch(dataset_accumulator):
         dataset = EdgeDataset(EDGES_FILENAME, model.index)
-    dataset_accumulator.print('Edge dataset initialization took')
-    print('Edge dataset contains {} edges.'.format(len(dataset)))
+    dataset_accumulator.print("Edge dataset initialization took")
+    print("Edge dataset contains {} edges.".format(len(dataset)))
     train_model(model, dataset)
     # model.evaluate_conceptnet(dataset)
