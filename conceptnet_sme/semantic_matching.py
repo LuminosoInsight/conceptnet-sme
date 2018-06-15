@@ -156,7 +156,7 @@ class EdgeDataset(Dataset):
         right_indices = []
         weights = []
         for count, (rel, left, right, weight) in enumerate(self.iter_edges_once()):
-            if count % 1000000 == 0:
+            if count % 500000 == 0:
                 print("Read {} edges.".format(count))
             if rel not in COMMON_RELATIONS:
                 continue
@@ -300,7 +300,10 @@ class CyclingSampler(Sampler):
         return iter(self._next_index, None)  # never raises StopIteration!
 
     def __len__(self):
-        return -1  # what else can we do?
+        """
+        Length makes no sense for a cycling sampler; it is effectively infiinte.
+        """
+        raise NotImplementedError
 
 
 class SemanticMatchingModel(nn.Module):
@@ -328,6 +331,7 @@ class SemanticMatchingModel(nn.Module):
 
         # Initialize term embeddings, including the index that converts terms
         # from strings to row numbers
+        print("Intializing term embeddings.")
         self.index = frame.index
         self.term_vecs = nn.Embedding(len(self.index), term_dim, sparse=True)
         self.term_vecs.weight.data.copy_(torch.from_numpy(frame.values))
@@ -341,15 +345,20 @@ class SemanticMatchingModel(nn.Module):
         # PyTorch convention is that inputs come before outputs, but the
         # resulting tensor is (k_2 x k_1 x k_1) because the math convention
         # is that outputs are on the left.
+        print("Initializing association tensor and relation embedding.")
         self.assoc_tensor = nn.Bilinear(term_dim, term_dim, relation_dim, bias=True)
         self.rel_vecs = nn.Embedding(N_RELS, relation_dim, sparse=True)
 
         # Using CUDA to run on the GPU requires different data types
+        print("Setting model device (cpu/gpu).")
         if use_cuda and torch.cuda.is_available():
             self.device = torch.device("cuda:0")
         else:
             self.device = torch.device("cpu")
 
+        # Create (and register) the identity tensor used to reset the synonym
+        # relation.  (Register it so it will be included in the state dict.)
+        print("Initializing identity slice.")
         self.register_buffer(
             "identity_slice",
             torch.tensor(np.eye(term_dim), dtype=torch.float32, device=self.device),
@@ -360,14 +369,17 @@ class SemanticMatchingModel(nn.Module):
         # These are used to convert the tensor products linearly into logits.
         # The initial values of these are set to numbers that appeared
         # reasonable based on a previous run.
+        print("Initializing logit scale factors.")
         self.truth_multiplier = nn.Parameter(
             torch.tensor(5.0, dtype=torch.float32, device=self.device)
         )
         self.truth_offset = nn.Parameter(
             torch.tensor(-3.0, dtype=torch.float32, device=self.device)
         )
-
-        self.to(self.device)  # make sure everything is on the right device
+        
+        # Make sure everything is on the right device.
+        print("Moving model to selected device (cpu/gpu).")
+        self.to(self.device)
 
     def reset_synonym_relation(self):
         """
@@ -439,29 +451,44 @@ class SemanticMatchingModel(nn.Module):
         """
         Load the pre-computed embeddings that form our starting point.
         """
-        accumulator = TimeAccumulator()
-        with stopwatch(accumulator):
-            print("Loading frame from file {}.".format(INITIAL_VECS_FILENAME))
+        total_accum = TimeAccumulator()
+        incremental_accum = TimeAccumulator()
+        print("Loading frame from file {}.".format(INITIAL_VECS_FILENAME))
+        with stopwatch(total_accum), stopwatch(incremental_accum):
             frame = load_hdf(INITIAL_VECS_FILENAME)
+        incremental_accum.print("Reading frame from file took", accumulated_time=0.0)
+        print("Filtering terms in frame by language.")
+        with stopwatch(total_accum), stopwatch(incremental_accum):
             labels = [
                 label
                 for label in frame.index
                 if get_uri_language(label) in LANGUAGES_TO_USE
             ]
             frame = frame.loc[labels]
-        accumulator.print("Loading frame took")
-        return frame.astype(np.float32)
+        incremental_accum.print("Filtering took", accumulated_time=0.0)
+        print("Casting frame to float32.")
+        with stopwatch(total_accum), stopwatch(incremental_accum):
+            frame = frame.astype(np.float32)
+        incremental_accum.print("Casting took", accumulated_time=0.0)
+        total_accum.print("Loading frame (including reading, filtering, casting) took")
+        return frame
 
     @staticmethod
     def load_model(filename):
         """
         Load the SME model from a file.
         """
-        accumulator = TimeAccumulator()
-        with stopwatch(accumulator):
-            print("Loading model from file {}.".format(filename))
+        total_accum = TimeAccumulator()
+        incremental_accum = TimeAccumulator()
+        print("Loading model from file {}.".format(filename))
+        with stopwatch(total_accum):
             frame = SemanticMatchingModel.load_initial_frame()
+        print("Constructing model from frame.")
+        with stopwatch(total_accum), stopwatch(incremental_accum):
             model = SemanticMatchingModel(frame)
+        incremental_accum.print("Constructing model took", accumulated_time=0.0)
+        print("Restoring model state from file.")
+        with stopwatch(total_accum), stopwatch(incremental_accum):
             # We have adopted the convention that models are moved to the
             # cpu before saving their state (as else loading would need
             # twice the gpu memory).  We (currently) do not support building
@@ -469,7 +496,8 @@ class SemanticMatchingModel(nn.Module):
             model.cpu()
             model.load_state_dict(torch.load(filename))
             model.to(model.device)
-        accumulator.print("Total time to load model:")
+        incremental_accum.print("Restoring took", accumulated_time=0.0)
+        total_accum.print("Total time to load model:")
         return model
 
     def evaluate_conceptnet(self, dataset, cutoff_value=-1, output_filename=None):
@@ -860,8 +888,10 @@ def train_model(model, dataset):
     to `sme/sme.model` every 5000 iterations, and you can run it for as
     long as you want.
     """
+    print("Starting model training.")
     model.train()
 
+    print("Making parallelized model.")
     def model_copier(model, device):
         model.cpu()
         frame = pd.DataFrame(model.term_vecs.weight.data.numpy(), index=model.index)
@@ -877,6 +907,7 @@ def train_model(model, dataset):
     # corresponding negative examples, with a difference of at least 1
     # logit between them. If the difference is less than this (especially
     # if it's negative), this adds to the relative loss.
+    print("Making loss functions.")
     relative_loss_function = nn.MarginRankingLoss(margin=1)
 
     # Absolute loss measures the cross-entropy of the predictions:
@@ -885,8 +916,11 @@ def train_model(model, dataset):
     # probability that accurately reflects the model's confidence.
     absolute_loss_function = nn.BCEWithLogitsLoss()
 
+    print("Making optimizer.")
     optimizer = optim.SGD(parallel_model.parameters(), lr=0.1)
     losses = []
+
+    print("Making loss targets.")
     true_target = torch.ones(
         [BATCH_SIZE], dtype=torch.float32, device=parallel_model.device
     )
@@ -896,6 +930,7 @@ def train_model(model, dataset):
     steps = 0
 
     # Note that you want drop_last=False with a CyclingSampler.
+    print("Making data loader.")
     data_loader = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
@@ -905,6 +940,8 @@ def train_model(model, dataset):
         sampler=CyclingSampler(dataset),
         pin_memory=True,
     )
+
+    print("Entering training (batch) loop.")
     for pos_batch, neg_batch, weights in data_loader:
         if parallel_model.device != torch.device("cpu"):
             pos_batch = tuple(
@@ -957,9 +994,18 @@ def train_model(model, dataset):
             losses.clear()
 
         if steps % 5000 == 0:
-            model.cpu()
-            torch.save(model.state_dict(), MODEL_FILENAME)
-            model.to(model.device)
+            incremental_accum = TimeAccumulator()
+            print("Saving model.")
+            with stopwatch(incremental_accum):
+                model.cpu()
+            incremental_accum.print("Moving model to cpu took", accumulated_time=0.0)
+            with stopwatch(incremental_accum):
+                torch.save(model.state_dict(), MODEL_FILENAME)
+            incremental_accum.print("Saving to disk took", accumulated_time=0.0)
+
+            with stopwatch(incremental_accum):
+                model.to(model.device)
+            incremental_accum.print("Moving model back to its device took", accumulated_time=0.0)
             print("saved")
 
             # With optim.SGD as the optimizer and when the model is
@@ -969,7 +1015,10 @@ def train_model(model, dataset):
             # every training iteration.)  So we force agreement between the
             # children periodically.
 
-            parallel_model.synchronize_children()
+            print("Synchronizing parallel model.")
+            with stopwatch(incremental_accum):
+                parallel_model.synchronize_children()
+            incremental_accum.print("Synchonizing took", accumulated_time=0.0)
 
     print()
 
@@ -980,14 +1029,28 @@ def get_model():
     by creating it from scratch if nothing is there.
     """
     if os.access(MODEL_FILENAME, os.F_OK):
+        print("Loading previously saved model.")
         model = SemanticMatchingModel.load_model(MODEL_FILENAME)
     else:
-        frame = SemanticMatchingModel.load_initial_frame()
-        model = SemanticMatchingModel(l2_normalize_rows(frame))
+        print("Creating a new model.")
+        total_accum = TimeAccumulator()
+        incremental_accum = TimeAccumulator()
+        with stopwatch(total_accum):
+            frame = SemanticMatchingModel.load_initial_frame()
+        print("Normalizing initial frame.")
+        with stopwatch(total_accum), stopwatch(incremental_accum):
+            frame = l2_normalize_rows(frame)
+        incremental_accum.print('Normalizing frame took', accumulated_time=0.0)
+        print('Constructing model from frame.')
+        with stopwatch(total_accum), stopwatch(incremental_accum):
+            model = SemanticMatchingModel(frame)
+        incremental_accum.print("Construction took", accumulated_time=0.0)
+        total_accum.print('Total model creation time:')
     return model
 
 
 if __name__ == "__main__":
+    print("Starting semantic matching.")
     model = get_model()
     print("Initializing edge dataset ....")
     dataset_accumulator = TimeAccumulator()
