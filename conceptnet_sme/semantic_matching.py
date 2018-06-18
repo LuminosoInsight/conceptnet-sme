@@ -1,9 +1,22 @@
 import torch
 
-try:
-    torch.multiprocessing.set_start_method("spawn")
-except RuntimeError:
-    pass
+# Set USE_MULTIPLE_GPUS = True to enable parallelization of training over
+# multiple GPUs (if available; setting it True when there are no or only one
+# GPU won't hurt, but it won't help either).
+
+USE_MULTIPLE_GPUS = False
+
+# Set NUM_BATCH_WORKERS > 0 to enable parallelization of generation of training
+# batches over multiple CPU cores (by spawning that number of worker processes;
+# 10 is a reasonable choice if you have multiple CPUs).
+
+NUM_BATCH_WORKERS = 0
+if NUM_BATCH_WORKERS > 0:
+    try:
+        torch.multiprocessing.set_start_method("spawn")
+    except RuntimeError:
+        pass
+
 import torch.autograd as autograd
 import torch.nn as nn
 import torch.optim as optim
@@ -371,10 +384,10 @@ class SemanticMatchingModel(nn.Module):
         # reasonable based on a previous run.
         print("Initializing logit scale factors.")
         self.truth_multiplier = nn.Parameter(
-            torch.tensor(5.0, dtype=torch.float32, device=self.device)
+            torch.tensor(5.0, dtype=torch.float32)
         )
         self.truth_offset = nn.Parameter(
-            torch.tensor(-3.0, dtype=torch.float32, device=self.device)
+            torch.tensor(-3.0, dtype=torch.float32)
         )
         
         # Make sure everything is on the right device.
@@ -665,7 +678,7 @@ class DataParallelizedModule(nn.Module):
     (for every parameter) and updates the gradients on every gpu.
     """
 
-    def __init__(self, module, device, copy_fn):
+    def __init__(self, module, device, copy_fn, parallelize=True):
         """
         Construct a parallelizing wrapper for the given module (an instance 
         of nn.Module).  The module will be moved to the given device (if 
@@ -673,15 +686,21 @@ class DataParallelizedModule(nn.Module):
         function (which should accept a module and a device, and return a 
         copy of the module suitable for placement on that device) and 
         moved to all other available gpus.
+        
+        If the (optional) parallelize argument is set to False, or if the 
+        requested device is the cpu, or if multiple gpus are not available, 
+        the model will be moved to the given device (if possible) for execution 
+        there.
         """
         super().__init__()
 
         # If the requested device is the cpu, or there is only one gpu,
-        # don't parallelize.
+        # or parallelization is turned off, don't parallelize.
         if (
             device == torch.device("cpu")
             or not torch.cuda.is_available()
             or torch.cuda.device_count() < 2
+            or not parallelize
         ):
             self.children = [module]
             self.devices = [device]
@@ -880,9 +899,16 @@ class DataParallelizedModule(nn.Module):
                 child_params[0].data = param_data_cpu.to(device)
 
 
-def train_model(model, dataset):
+def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False):
     """
     Incrementally train the model on the given dataset.
+
+    If a positive number of batch worker processes is requested, generation 
+    of training data batches will be done in parallel across multiple CPU cores 
+    by spawning that number of child processes.
+
+    If use of multiple GPUs is requested (and they are available), evaluation 
+    of batches will be parallelized across all available GPUs.
 
     As it is, this function will never return. It writes the results so far
     to `sme/sme.model` every 5000 iterations, and you can run it for as
@@ -901,7 +927,7 @@ def train_model(model, dataset):
         new_model.to(device)
         return new_model
 
-    parallel_model = DataParallelizedModule(model, model.device, copy_fn=model_copier)
+    parallel_model = DataParallelizedModule(model, model.device, copy_fn=model_copier, parallelize=use_multiple_gpus)
 
     # Relative loss says that the positive examples should outrank their
     # corresponding negative examples, with a difference of at least 1
@@ -935,7 +961,7 @@ def train_model(model, dataset):
         dataset,
         batch_size=BATCH_SIZE,
         drop_last=False,
-        num_workers=10,
+        num_workers=num_batch_workers,
         collate_fn=dataset.collate_batch,
         sampler=CyclingSampler(dataset),
         pin_memory=True,
@@ -1058,5 +1084,5 @@ if __name__ == "__main__":
         dataset = EdgeDataset(EDGES_FILENAME, model.index)
     dataset_accumulator.print("Edge dataset initialization took")
     print("Edge dataset contains {} edges.".format(len(dataset)))
-    train_model(model, dataset)
+    train_model(model, dataset, num_batch_workers=NUM_BATCH_WORKERS, use_multiple_gpus=USE_MULTIPLE_GPUS)
     # model.evaluate_conceptnet(dataset)
