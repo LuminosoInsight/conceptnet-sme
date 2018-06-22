@@ -4,13 +4,13 @@ import torch
 # multiple GPUs (if available; setting it True when there are no or only one
 # GPU won't hurt, but it won't help either).
 
-USE_MULTIPLE_GPUS = False
+USE_MULTIPLE_GPUS = True
 
 # Set NUM_BATCH_WORKERS > 0 to enable parallelization of generation of training
 # batches over multiple CPU cores (by spawning that number of worker processes;
 # 10 is a reasonable choice if you have multiple CPUs).
 
-NUM_BATCH_WORKERS = 0
+NUM_BATCH_WORKERS = 10
 if NUM_BATCH_WORKERS > 0:
     try:
         torch.multiprocessing.set_start_method("spawn")
