@@ -25,7 +25,6 @@ from torch.utils.data.sampler import Sampler
 from conceptnet5.vectors.formats import save_hdf, save_npy
 import numpy as np
 import pandas as pd
-import copy
 import random
 import pathlib
 import os
@@ -324,15 +323,13 @@ class SemanticMatchingModel(nn.Module):
     The PyTorch model for semantic matching energy over ConceptNet.
     """
 
-    def __init__(self, frame, use_cuda=True, term_dim=300, relation_dim=10):
+    def __init__(self, frame, use_cuda=True, relation_dim=10):
         """
         Parameters:
 
         `frame`: a pandas DataFrame of pre-trained word embeddings over the
         vocabulary of ConceptNet. `conceptnet5.vectors.formats.load_hdf`
         can load these.
-
-        `term_dim`: the number of dimensions in the term embedding.
 
         `use_cuda`: whether to use GPU-accelerated PyTorch objects.
 
@@ -343,10 +340,12 @@ class SemanticMatchingModel(nn.Module):
         super().__init__()
 
         # Initialize term embeddings, including the index that converts terms
-        # from strings to row numbers
+        # from strings to row numbers and the index converting relations to
+        # row numbers in the relation vector embedding.
         print("Intializing term embeddings.")
         self.index = frame.index
-        self.term_vecs = nn.Embedding(len(self.index), term_dim, sparse=True)
+        n_frame_terms, term_dim = frame.values.shape
+        self.term_vecs = nn.Embedding(n_frame_terms, term_dim, sparse=True)
         self.term_vecs.weight.data.copy_(torch.from_numpy(frame.values))
 
         # The assoc_tensor is a (k_2 x k_1 x k_1) tensor that represents
@@ -441,6 +440,105 @@ class SemanticMatchingModel(nn.Module):
 
         return energy_b * self.truth_multiplier + self.truth_offset
 
+    def score_edges(
+            self,
+            edges,
+            batch_size=2,
+            convert_logits_to_probas=False,
+            device=None
+    ):
+        """
+        Given a SemanticMatchingModel and an iteratable of edges (in the form of 
+        tuples starting with a relation, a left endpoint, and a right endpoint, 
+        where the endpoints have been run through uri_prefix), return an iterator 
+        yielding the same tuples paired with the model's scores to the edge, 
+        for all of the given edges whose endpoints are present in the model's 
+        term index and whose relation is in the model's relation index.
+        
+        Scores are returned in units of logits, unless conversion to probabilities 
+        is requested by setting the optional paramenter convert_logits_to_probas 
+        to True.  If a device is specified (with the device parameter) then the 
+        model will be moved to that device before scoring takes place; otherwise 
+        the model will be moved to the device given by its device attribute (if not 
+        already there).  Edges are scored in batches, with a default size of 32 (which 
+        may be changed by setting the batch_size parameter).
+        """
+        # If a device is specified, move the model there before applying it.
+        # Regardless, input for the model will be constructed in batches on the
+        # cpu then moved to the device where the model is, and outputs will be
+        # moved from there to the cpu.
+        if device is None:
+            device = self.device
+        self.to(device)
+
+        # Put the model in evaluation mode.
+        self.eval()
+
+        # We'll batch the edges together before handing them to the model for
+        # evaluation, for efficiency's sake.  As torch tensors are stored row-major,
+        # and the model expects three tensors as input, we make batches of size
+        # 3 x b, then split them by rows to feed them to the model.
+        input_batch = torch.empty(
+            [3, batch_size], dtype=torch.int64, requires_grad=False)
+        input_batch.pin_memory() # speed up any transfer to gpu
+        input_batch_on_device = torch.empty_like(input_batch, device=device)
+        input_batch_edges = []
+
+        position_in_batch = 0
+        for edge in edges:
+            # Translate the string fields of the edge to indices the model knows.
+            rel = edge[0]
+            left = edge[1]
+            right = edge[2]
+            try:
+                rel_idx = RELATION_INDEX.get_loc(rel)
+                left_idx = self.index.get_loc(left)
+                right_idx = self.index.get_loc(right)
+            except KeyError:
+                continue # the model can't handle this edge
+
+            # Insert the new edge's data into the growing batch.
+            input_batch[0, position_in_batch] = rel_idx
+            input_batch[1, position_in_batch] = left_idx
+            input_batch[2, position_in_batch] = right_idx
+            input_batch_edges.append(edge)
+
+            # Keep track of where to insert, and when a batch is full.
+            position_in_batch += 1
+            if position_in_batch < batch_size:
+                continue
+
+            # Handle a full batch buffer.
+
+            input_batch_on_device = input_batch.cuda(device, non_blocking=True)
+            output_batch = self(
+                input_batch_on_device[0], input_batch_on_device[1], input_batch_on_device[2]
+            )
+            output_batch.detach_() # requiring grad prevents calling numpy()
+            if convert_logits_to_probas:
+                output_batch.sigmoid_()
+            output_batch = output_batch.cpu().numpy()
+            for i_edge in range(batch_size):
+                yield output_batch[i_edge], input_batch_edges[i_edge]
+            position_in_batch = 0 # setup next batch
+            input_batch_edges = []
+
+        # Handle any final (shorter than normal) batch.
+        
+        if position_in_batch > 0:
+            input_batch_on_device = input_batch.cuda(device, non_blocking=True)
+            output_batch = self(
+                input_batch_on_device[0, 0:position_in_batch],
+                input_batch_on_device[1, 0:position_in_batch],
+                input_batch_on_device[2, 0:position_in_batch]
+            )
+            output_batch.detach_() # requiring grad prevents calling numpy()
+            if convert_logits_to_probas:
+                output_batch.sigmoid_()
+            output_batch = output_batch.cpu().numpy()
+            for i_edge in range(position_in_batch):
+                yield output_batch[i_edge], input_batch_edges[i_edge]
+    
     def show_debug(self, batch, energy, positive):
         """
         On certain iterations, we show the training examples and what the model
@@ -487,9 +585,10 @@ class SemanticMatchingModel(nn.Module):
         return frame
 
     @staticmethod
-    def load_model(filename):
+    def load_model(filename, use_cuda=True):
         """
-        Load the SME model from a file.
+        Load the SME model from a file.  If use_cuda is True (the default), the 
+        model will be placed on a gpu, otherwise on the cpu.
         """
         total_accum = TimeAccumulator()
         incremental_accum = TimeAccumulator()
@@ -498,7 +597,7 @@ class SemanticMatchingModel(nn.Module):
             frame = SemanticMatchingModel.load_initial_frame()
         print("Constructing model from frame.")
         with stopwatch(total_accum), stopwatch(incremental_accum):
-            model = SemanticMatchingModel(frame)
+            model = SemanticMatchingModel(frame, use_cuda=use_cuda)
         incremental_accum.print("Constructing model took", accumulated_time=0.0)
         print("Restoring model state from file.")
         with stopwatch(total_accum), stopwatch(incremental_accum):
@@ -513,7 +612,7 @@ class SemanticMatchingModel(nn.Module):
         total_accum.print("Total time to load model:")
         return model
 
-    def evaluate_conceptnet(self, dataset, cutoff_value=-1, output_filename=None):
+    def evaluate_conceptnet(self, input_file, cutoff_value=-1, output_filename=None):
         """
         Use the SME model to "sanity-check" existing edges in ConceptNet.
         We particularly highlight edges that get a value of -1 or less, which
@@ -525,30 +624,33 @@ class SemanticMatchingModel(nn.Module):
             out = open(output_filename, "w", encoding="utf-8")
         else:
             out = None
-        for rel, left, right, weight in dataset.iter_edges_once():
-            try:
-                rel_idx = RELATION_INDEX.get_loc(rel)
-                left_idx = self.index.get_loc(left)
-                right_idx = self.index.get_loc(right)
-            except KeyError:
-                continue
 
-            rel_tensor = torch.tensor([rel_idx], dtype=torch.int64, device=self.device)
-            left_tensor = torch.tensor(
-                [left_idx], dtype=torch.int64, device=self.device
-            )
-            right_tensor = torch.tensor(
-                [right_idx], dtype=torch.int64, device=self.device
-            )
+        with open(input_file, "rt", encoding="utf-8") as fp:
+            for line in fp:
+                _assertion, rel, left, right, _rest = line.split("\t", 4)
+                try:
+                    rel_idx = RELATION_INDEX.get_loc(rel)
+                    left_idx = self.index.get_loc(left)
+                    right_idx = self.index.get_loc(right)
+                except KeyError:
+                    continue
 
-            model_output = self(rel_tensor, left_tensor, right_tensor)
+                rel_tensor = torch.tensor([rel_idx], dtype=torch.int64, device=self.device)
+                left_tensor = torch.tensor(
+                    [left_idx], dtype=torch.int64, device=self.device
+                )
+                right_tensor = torch.tensor(
+                    [right_idx], dtype=torch.int64, device=self.device
+                )
 
-            value = model_output.item()
-            assertion = assertion_uri(rel, left, right)
-            if value < cutoff_value:
-                print("%4.4f\t%s" % (value, assertion))
-            if out is not None:
-                print("%4.4f\t%s" % (value, assertion), file=out)
+                model_output = self(rel_tensor, left_tensor, right_tensor)
+
+                value = model_output.item()
+                assertion = assertion_uri(rel, left, right)
+                if value < cutoff_value:
+                    print("%4.4f\t%s" % (value, assertion))
+                if out is not None:
+                    print("%4.4f\t%s" % (value, assertion), file=out)
 
     def export(self, dirname):
         """
