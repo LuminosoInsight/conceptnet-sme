@@ -12,6 +12,7 @@ import msgpack
 import os
 
 from collections import defaultdict
+
 from conceptnet5.uri import uri_prefix
 from semantic_matching import SemanticMatchingModel, stopwatch, TimeAccumulator
 
@@ -108,28 +109,25 @@ def evaluate_sources(model, root, device=None, batch_size=2, convert_logits_to_p
                 scores_by_source[source][edge] = score
     return scores_by_dataset, scores_by_source
 
-def save_scores(scores, path, **kwargs):
+def save_scores(scores, path):
     """
-    Serialize scores as returned by evaluate_sources to a file at the given 
-    path.  Any other keyword arguments given will be passed to msgpack.pack 
-    (which does the serialization).
+    Serialize scores as returned by evaluate_sources to a msgpack file at 
+    the given path.  
     """
-    canonical_scores = {source: {' '.join(edge):float(score)
+    canonical_scores = {source: {edge:float(score)
                                  for edge, score in source_scores.items()}
                         for source, source_scores in scores.items()}
     with open(path, 'wb') as fp:
-        msgpack.pack(canonical_scores, fp, **kwargs)
+        msgpack.pack(canonical_scores, fp)
 
-def load_scores(path, **kwargs):
+def load_scores(path):
     """
-    Deserialize scores serialized by save_scores to the given path.  Any other 
-    keyword arguments given are passed to msgpack.unpack (which does the 
-    deserialization).
+    Deserialize scores serialized by save_scores to the given path.
     """
     with open(path, 'rb') as fp:
-        canonical_scores = msgpack.unpack(fp, **kwargs)
-    scores = {source.decode('utf-8'): {tuple(edge.decode('utf-8').split()):np.float32(score)
-                                       for edge, score in source_scores.items()}
+        canonical_scores = msgpack.unpack(fp, use_list=False, encoding='utf-8')
+    scores = {source: {tuple(edge):np.float32(score)
+                       for edge, score in source_scores.items()}
               for source, source_scores in canonical_scores.items()}
     return scores
 
@@ -152,25 +150,23 @@ def composite_scores(raw_scores):
               for source, (source_mean, source_sum) in result.items()}
     return result
 
-def save_composite_scores(scores, path, **kwargs):
+def save_composite_scores(scores, path):
     """
-    Serialize composite scores as returned by composite_scores to the given path.  
-    Any additional keyword arguments given are passed to msgpack.pack (which is 
-    used to do the serialization).
+    Serialize composite scores as returned by composite_scores to a msgpack file 
+    atthe given path.
     """
     canonical_scores = {source: (float(s0), float(s1)) for source, (s0, s1) in scores.items()}
     with open(path, 'wb') as fp:
-        msgpack.pack(canonical_scores, fp, **kwargs)
+        msgpack.pack(canonical_scores, fp)
 
-def load_composite_scores(path, **kwargs):
+def load_composite_scores(path):
     """
     Deserialize composite scores serialized by save_composite_scores to the 
-    given path.  Any additional keyword arguments given are passed to msgpack.unpack
-    (which is used to do the deserialization).
+    given path.
     """
     with open(path, 'rb') as fp:
-        canonical_scores = msgpack.unpack(fp, **kwargs)
-    scores = {source.decode('utf-8'): (np.float32(s0), np.float32(s1))
+        canonical_scores = msgpack.unpack(fp, use_list=False, encoding='utf-8')
+    scores = {source: (np.float32(s0), np.float32(s1))
               for source, (s0, s1) in canonical_scores.items()}
     return scores
 

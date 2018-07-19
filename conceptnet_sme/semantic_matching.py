@@ -538,6 +538,25 @@ class SemanticMatchingModel(nn.Module):
             output_batch = output_batch.cpu().numpy()
             for i_edge in range(position_in_batch):
                 yield output_batch[i_edge], input_batch_edges[i_edge]
+
+    def make_edge_score_file(self, input_filename, output_filename, **kwargs):
+        """
+        Read edges from the given input file, score them via score_edges, and 
+        write 4-tuples (rel, left, right, score) as a msgpack stream to the 
+        given output file.  Any additional kwargs given are passed on to 
+        score_edges.
+        """
+        def edge_iterator(input_filename):
+            with open(input_filename, "rt") as fp:
+                for line in fp:
+                    fields = line.split('\t')
+                    rel = fields[0]
+                    left = uri_prefix(fields[1])
+                    right = uri_prefix(fields[2])
+                    yield rel, left, right
+        writer = MsgpackStreamWriter(output_filename)
+        for score, (rel, left, right) in self.score_edges(edge_iterator(input_filename), **kwargs):
+            writer.write((rel, left, right, float(score)))
     
     def show_debug(self, batch, energy, positive):
         """
