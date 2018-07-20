@@ -1194,7 +1194,7 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False,
             if validation_dataset is not None:
                 print("Evaluating loss over validation data.")
                 model.eval()  # turn off training mode temporarily
-                n_validation_batches = 1000
+                n_validation_batches = 50
                 validation_loss = torch.tensor(0, dtype=torch.float32,
                                                device=parallel_model.device)
                 
