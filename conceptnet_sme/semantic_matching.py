@@ -1100,7 +1100,7 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False,
             drop_last=False,
             num_workers=num_batch_workers,
             collate_fn=validation_dataset.collate_batch,
-            sampler=CyclingSampler(dataset),
+            sampler=CyclingSampler(validation_dataset),
             pin_memory=True
         )
         # Since we want to step through the (infinite, cyclic) sequence of
