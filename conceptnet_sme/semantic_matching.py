@@ -23,6 +23,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.sampler import Sampler
 from conceptnet5.vectors.formats import save_hdf, save_npy
+from conceptnet5.formats.msgpack_stream import MsgpackStreamWriter
 import numpy as np
 import pandas as pd
 import random
