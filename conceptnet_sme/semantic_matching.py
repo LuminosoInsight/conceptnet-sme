@@ -49,6 +49,7 @@ INITIAL_VECS_FILENAME = get_data_filename("vectors/numberbatch.h5")
 EDGES_FILENAME = get_data_filename("collated/sorted/edges-shuf.csv")
 MODEL_FILENAME = get_data_filename("sme/sme.model")
 NEG_SAMPLES = 5
+ADVERSARIAL_SAMPLES = 3
 PREDICT_SHARDS = 100
 LANGUAGES_TO_USE = [
     "en",
@@ -247,7 +248,7 @@ class EdgeDataset(Dataset):
 
         examples.append((int(rel_idx), int(left_idx), int(right_idx), weight))
 
-        n_neg = NEG_SAMPLES + 2
+        n_neg = NEG_SAMPLES + ADVERSARIAL_SAMPLES * 2
 
         for iter in range(NEG_SAMPLES):
             corrupt_rel_idx = rel_idx
@@ -270,19 +271,23 @@ class EdgeDataset(Dataset):
 
             examples.append((int(corrupt_rel_idx), int(corrupt_left_idx), int(corrupt_right_idx), weight / n_neg))
 
-        adversarial_right, amax_right = self.model.predict_terms(
+        best_terms_right, best_values_right = self.model.predict_terms(
             torch.LongTensor([rel_idx]),
             torch.LongTensor([left_idx]),
-            PREDICT_SHARDS, random.randrange(PREDICT_SHARDS), forward=True
+            PREDICT_SHARDS, random.randrange(PREDICT_SHARDS), forward=True, topk=ADVERSARIAL_SAMPLES
         )
-        adversarial_left, amax_left = self.model.predict_terms(
+        best_terms_left, best_values_left = self.model.predict_terms(
             torch.LongTensor([rel_idx]),
             torch.LongTensor([right_idx]),
-            PREDICT_SHARDS, random.randrange(PREDICT_SHARDS), forward=False
+            PREDICT_SHARDS, random.randrange(PREDICT_SHARDS), forward=False, topk=ADVERSARIAL_SAMPLES
         )
 
-        examples.append((int(orig_rel_idx), int(adversarial_left.data[0]), int(right_idx), weight / n_neg))
-        examples.append((int(orig_rel_idx), int(left_idx), int(adversarial_right.data[0]), weight / n_neg))
+        for row in best_terms_left:
+            for predicted_left in row:
+                examples.append((int(orig_rel_idx), int(predicted_left), int(right_idx), weight / n_neg))
+        for row in best_terms_right:
+            for predicted_right in row:
+                examples.append((int(orig_rel_idx), int(left_idx), int(predicted_right), weight / n_neg))
 
         targets = [example[:3] in self.edge_set for example in examples]
         assert examples[0][:3] in self.edge_set
@@ -295,9 +300,10 @@ class EdgeDataset(Dataset):
             targets=torch.FloatTensor(targets)
         )
 
-        eval_batch = rels[-2:], lefts[-2:], rights[-2:], weights[-2:], targets[-2:]
+        lastk = ADVERSARIAL_SAMPLES * 2
+        eval_batch = rels[-lastk:], lefts[-lastk:], rights[-lastk:], weights[-lastk:], targets[-lastk:]
         if random.random() < 0.01:
-            self.model.show_debug(eval_batch, torch.Tensor([amax_left, amax_right]))
+            self.model.show_debug(eval_batch)
         return data
 
     def collate_batch(self, batch):
@@ -469,7 +475,23 @@ class SemanticMatchingModel(nn.Module):
 
         return energy_b * self.truth_multiplier + self.truth_offset
 
-    def predict_terms(self, rels, terms, nshards=1, offset=0, forward=True):
+    def predict_wrapper(self, relname, termname, forward=True, topk=10):
+        rel_idx = RELATION_INDEX.get_loc(relname)
+        term_idx = self.index.get_loc(termname)
+        best_terms, best_values = self.predict_terms(
+            torch.LongTensor([rel_idx]),
+            torch.LongTensor([term_idx]),
+            1, 0, forward=forward, topk=topk
+        )
+
+        best_terms = best_terms[0].cpu().numpy()
+        best_values = best_values[0].cpu().numpy()
+
+        best_term_names = self.index[best_terms]
+        return pd.DataFrame(best_values, index=best_term_names)
+
+
+    def predict_terms(self, rels, terms, nshards=1, offset=0, forward=True, topk=1):
         with torch.no_grad():
             # Indices here use different letters to represent different dimensions, like
             # in Einstein notation.
@@ -484,7 +506,7 @@ class SemanticMatchingModel(nn.Module):
             # as it maps the vocabulary to term vectors.
             lang = get_uri_language(self.index[terms[0]])
             lang_indices = self.index_by_language[lang]
-            candidate_indices = np.array([
+            candidate_indices = torch.LongTensor([
                 idx for idx in lang_indices[offset::nshards]
                 if idx != int(terms[0])
             ])
@@ -503,18 +525,18 @@ class SemanticMatchingModel(nn.Module):
             else:
                 predictions_b_m = torch.einsum('bk,br,klr,ml->bm', (rels_b_k, terms_b_T, assoc_k_L_R, candidate_terms_m_T))
 
-            max_prediction, best_terms = torch.max(predictions_b_m, dim=1)
-            best_terms_reindexed = candidate_indices[best_terms.cpu().numpy()]
+            best_values, best_indices = torch.topk(predictions_b_m, topk, dim=1)
+            best_terms_reindexed = torch.take(candidate_indices, best_indices.cpu())
+            return best_terms_reindexed, best_values
 
-            return best_terms_reindexed, torch.max(max_prediction).item()
 
-    def show_debug(self, batch, energy):
+    def show_debug(self, batch):
         """
         On certain iterations, we show the training examples and what the model
         believed about them.
         """
-        index_order = np.argsort(energy.data)
         rel_indices, left_indices, right_indices, weights, targets = batch
+        index_order = np.arange(len(weights))
 
         for i in index_order:
             rel = RELATION_INDEX[int(rel_indices[i])]
@@ -522,8 +544,7 @@ class SemanticMatchingModel(nn.Module):
             right = self.index[int(right_indices[i])]
             if get_uri_language(left) == 'en':
                 target = int(targets[i])
-                value = energy[i]
-                print(f'{target} {value:+12.4g}  {rel:<20} {left:<20} {right:<20}')
+                print(f'{target}  {rel:<20} {left:<20} {right:<20}')
 
     @staticmethod
     def load_initial_frame():
