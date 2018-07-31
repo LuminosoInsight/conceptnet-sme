@@ -549,12 +549,13 @@ class SemanticMatchingModel(nn.Module):
         score_edges.
         """
         def edge_iterator(input_filename):
-            with open(input_filename, "rt") as fp:
+            with open(input_filename, "rt", encoding="utf-8") as fp:
                 for line in fp:
                     fields = line.split('\t')
-                    rel = fields[0]
-                    left = uri_prefix(fields[1])
-                    right = uri_prefix(fields[2])
+                    # fields[0] is the assertion
+                    rel = fields[1]
+                    left = uri_prefix(fields[2])
+                    right = uri_prefix(fields[3])
                     yield rel, left, right
         writer = MsgpackStreamWriter(output_filename)
         for score, (rel, left, right) in self.score_edges(edge_iterator(input_filename), **kwargs):
