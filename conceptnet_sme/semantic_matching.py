@@ -10,14 +10,13 @@ USE_MULTIPLE_GPUS = True
 # batches over multiple CPU cores (by spawning that number of worker processes;
 # 10 is a reasonable choice if you have multiple CPUs).
 
-NUM_BATCH_WORKERS = 10
+NUM_BATCH_WORKERS = 0
 if NUM_BATCH_WORKERS > 0:
     try:
         torch.multiprocessing.set_start_method("spawn")
     except RuntimeError:
         pass
 
-import torch.autograd as autograd
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
@@ -46,11 +45,14 @@ from conceptnet5.vectors.transforms import l2_normalize_rows
 
 RELATION_INDEX = pd.Index(COMMON_RELATIONS)
 N_RELS = len(RELATION_INDEX)
-INITIAL_VECS_FILENAME = get_data_filename("vectors/numberbatch-biased.h5")
+INITIAL_VECS_FILENAME = get_data_filename("vectors/numberbatch.h5")
+#INITIAL_VECS_FILENAME = get_data_filename("vectors/mini.h5")
 EDGES_FILENAME = get_data_filename("collated/sorted/edges-shuf.csv")
 VALIDATION_FILENAME = get_data_filename("collated/sorted/edges-shuf-validation.csv")
 MODEL_FILENAME = get_data_filename("sme/sme.model")
 NEG_SAMPLES = 5
+ADVERSARIAL_SAMPLES = 3
+PREDICT_SHARDS = 100
 LANGUAGES_TO_USE = [
     "en",
     "fr",
@@ -114,7 +116,7 @@ ENTAILED_INDICES, UNRELATED_INDICES = _make_rel_chart()
 @contextlib.contextmanager
 def stopwatch(consumer):
     """
-    After executing the managed block of code, call the provided consumer with 
+    After executing the managed block of code, call the provided consumer with
     two arguments, the start and end times of the execution of the block.
     """
     start_time = time.perf_counter()
@@ -127,8 +129,8 @@ def stopwatch(consumer):
 
 class TimeAccumulator:
     """
-    A simple consumer for use with stopwatches, that accumulates the total 
-    elapsed time over multiple calls, and has a convenience method for printing 
+    A simple consumer for use with stopwatches, that accumulates the total
+    elapsed time over multiple calls, and has a convenience method for printing
     the total time (and optionally resetting it).
     """
 
@@ -149,28 +151,31 @@ class TimeAccumulator:
 
 class EdgeDataset(Dataset):
     """
-    Wrapper class (around an iteration over ConceptNet edges) that enables us 
+    Wrapper class (around an iteration over ConceptNet edges) that enables us
     to use a torch DataLoader to parallelize generation of training batches.
     """
 
-    def __init__(self, filename, index):
+    def __init__(self, filename, model):
         """
-        Construct an edge dataset from a filename (of a tab-separated 
-        ConceptNet edge file, which should be in random order), and a (pandas) 
-        index mapping (row) numbers to terms of the ConceptNet vocabulary. 
+        Construct an edge dataset from a filename (of a tab-separated
+        ConceptNet edge file, which should be in random order), and a (pandas)
+        index mapping (row) numbers to terms of the ConceptNet vocabulary.
         """
         super().__init__()
         self.filename = filename
-        self.index = index
+        self.model = model
+        self.index = model.index
         self.n_terms = len(self.index)
+        self.edge_set = set()
         # Cache the edges in CPU memory as torch LongTensors,
         # skipping edges we don't intend to process.
         rel_indices = []
         left_indices = []
         right_indices = []
         weights = []
+
         for count, (rel, left, right, weight) in enumerate(self.iter_edges_once()):
-            if count % 500000 == 0:
+            if count % 500000 == 0 and count > 0:
                 print("Read {} edges.".format(count))
             if rel not in COMMON_RELATIONS:
                 continue
@@ -187,6 +192,16 @@ class EdgeDataset(Dataset):
             rel_indices.append(rel_idx)
             left_indices.append(left_idx)
             right_indices.append(right_idx)
+
+            self.edge_set.add((rel_idx, left_idx, right_idx))
+            entailed_rels = ENTAILED_INDICES[RELATION_INDEX[rel_idx]]
+            for entailed in entailed_rels:
+                self.edge_set.add((entailed, left_idx, right_idx))
+            if rel in SYMMETRIC_RELATIONS:
+                self.edge_set.add((rel_idx, right_idx, left_idx))
+                for entailed in entailed_rels:
+                    self.edge_set.add((entailed, right_idx, left_idx))
+
             weights.append(weight)
         if len(rel_indices) < 1:
             print("No edges survived filtering; fitting is impossible!")
@@ -210,15 +225,17 @@ class EdgeDataset(Dataset):
 
     def __getitem__(self, i_edge):
         """
-        Produce a positive example and weight and a batch of (of size 
-        NEG_SAMPLES) of negative examples, derived from the edge at the 
-        given index.  The return values are three torch tensors containing 
-        the positive example, the negative examples, and the weights.
+        Produce a positive example, followed by a number of generated examples that
+        are presumed to be negative (but might accidentally be positive). Return these
+        examples collated into tensors.
         """
         rel_idx = self.rel_indices[i_edge]
+        orig_rel_idx = rel_idx
         left_idx = self.left_indices[i_edge]
         right_idx = self.right_indices[i_edge]
         weight = self.edge_weights[i_edge]
+
+        examples = []
 
         rel = RELATION_INDEX[rel_idx]
 
@@ -231,14 +248,9 @@ class EdgeDataset(Dataset):
             rel_idx = random.choice(ENTAILED_INDICES[rel])
             rel = COMMON_RELATIONS[rel_idx]
 
-        pos_rels = [rel_idx]
-        pos_left = [left_idx]
-        pos_right = [right_idx]
-        weights = [weight]
+        examples.append((int(rel_idx), int(left_idx), int(right_idx), weight))
 
-        neg_rels = []
-        neg_left = []
-        neg_right = []
+        n_neg = NEG_SAMPLES + ADVERSARIAL_SAMPLES * 2
 
         for iter in range(NEG_SAMPLES):
             corrupt_rel_idx = rel_idx
@@ -259,44 +271,60 @@ class EdgeDataset(Dataset):
                 while corrupt_right_idx == right_idx:
                     corrupt_right_idx = random.randrange(self.n_terms)
 
-            neg_rels.append(corrupt_rel_idx)
-            neg_left.append(corrupt_left_idx)
-            neg_right.append(corrupt_right_idx)
+            examples.append((int(corrupt_rel_idx), int(corrupt_left_idx), int(corrupt_right_idx), weight / n_neg))
 
-        pos_data = dict(
-            rel=torch.LongTensor(pos_rels),
-            left=torch.LongTensor(pos_left),
-            right=torch.LongTensor(pos_right),
+        best_terms_right, best_values_right = self.model.predict_terms(
+            torch.LongTensor([rel_idx]),
+            torch.LongTensor([left_idx]),
+            PREDICT_SHARDS, random.randrange(PREDICT_SHARDS), forward=True, topk=ADVERSARIAL_SAMPLES
         )
-        neg_data = dict(
-            rel=torch.LongTensor(neg_rels),
-            left=torch.LongTensor(neg_left),
-            right=torch.LongTensor(neg_right),
+        best_terms_left, best_values_left = self.model.predict_terms(
+            torch.LongTensor([rel_idx]),
+            torch.LongTensor([right_idx]),
+            PREDICT_SHARDS, random.randrange(PREDICT_SHARDS), forward=False, topk=ADVERSARIAL_SAMPLES
         )
-        weights = torch.FloatTensor(weights)
-        return dict(positive_data=pos_data, negative_data=neg_data, weights=weights)
+
+        for row in best_terms_left:
+            for predicted_left in row:
+                examples.append((int(orig_rel_idx), int(predicted_left), int(right_idx), weight / n_neg))
+        for row in best_terms_right:
+            for predicted_right in row:
+                examples.append((int(orig_rel_idx), int(left_idx), int(predicted_right), weight / n_neg))
+
+        targets = [example[:3] in self.edge_set for example in examples]
+        assert examples[0][:3] in self.edge_set
+        rels, lefts, rights, weights = zip(*examples)
+        data = dict(
+            rels=torch.LongTensor(rels),
+            lefts=torch.LongTensor(lefts),
+            rights=torch.LongTensor(rights),
+            weights=torch.FloatTensor(weights),
+            targets=torch.FloatTensor(targets)
+        )
+
+        lastk = ADVERSARIAL_SAMPLES * 2
+        eval_batch = rels[-lastk:], lefts[-lastk:], rights[-lastk:], weights[-lastk:], targets[-lastk:]
+        if random.random() < 0.01:
+            self.model.show_debug(eval_batch)
+        return data
 
     def collate_batch(self, batch):
         """
-        Collates batches (as returned by a DataLoader that batches 
-        the outputs of calls to __getitem__) into tensors (as required 
+        Collates batches (as returned by a DataLoader that batches
+        the outputs of calls to __getitem__) into tensors (as required
         by the train method of SemanticMatchingModel).
         """
-        pos_rels = torch.cat(list(x["positive_data"]["rel"] for x in batch))
-        pos_left = torch.cat(list(x["positive_data"]["left"] for x in batch))
-        pos_right = torch.cat(list(x["positive_data"]["right"] for x in batch))
-        neg_rels = torch.cat(list(x["negative_data"]["rel"] for x in batch))
-        neg_left = torch.cat(list(x["negative_data"]["left"] for x in batch))
-        neg_right = torch.cat(list(x["negative_data"]["right"] for x in batch))
-        weights = torch.cat(list(x["weights"] for x in batch))
-        pos_data = (pos_rels, pos_left, pos_right)
-        neg_data = (neg_rels, neg_left, neg_right)
-        return pos_data, neg_data, weights
+        rels = torch.cat([x["rels"] for x in batch])
+        lefts = torch.cat([x["lefts"] for x in batch])
+        rights = torch.cat([x["rights"] for x in batch])
+        weights = torch.cat([x["weights"] for x in batch])
+        targets = torch.cat([x["targets"] for x in batch])
+        return (rels, lefts, rights, weights, targets)
 
 
 class CyclingSampler(Sampler):
     """
-    Like a sequential sampler, but these samplers cycle repeatedly over the 
+    Like a sequential sampler, but these samplers cycle repeatedly over the
     data source, and so have infinite length.
     """
 
@@ -315,7 +343,7 @@ class CyclingSampler(Sampler):
 
     def __len__(self):
         """
-        Length makes no sense for a cycling sampler; it is effectively infiinte.
+        Length makes no sense for a cycling sampler; it is effectively infinite.
         """
         raise NotImplementedError
 
@@ -349,6 +377,12 @@ class SemanticMatchingModel(nn.Module):
         n_frame_terms, term_dim = frame.values.shape
         self.term_vecs = nn.Embedding(n_frame_terms, term_dim, sparse=True)
         self.term_vecs.weight.data.copy_(torch.from_numpy(frame.values))
+
+        # Create a mapping from languages to index numbers
+        self.index_by_language = {}
+        for i, term in enumerate(frame.index):
+            lang = get_uri_language(term)
+            self.index_by_language.setdefault(lang, []).append(i)
 
         # The assoc_tensor is a (k_2 x k_1 x k_1) tensor that represents
         # interactions between the relations and the terms. k_1 is the
@@ -390,7 +424,7 @@ class SemanticMatchingModel(nn.Module):
         self.truth_offset = nn.Parameter(
             torch.tensor(-3.0, dtype=torch.float32)
         )
-        
+
         # Make sure everything is on the right device.
         print("Moving model to selected device (cpu/gpu).")
         self.to(self.device)
@@ -421,24 +455,24 @@ class SemanticMatchingModel(nn.Module):
         A truth judgment is a logit, and can be converted to a probability
         using the sigmoid function.
         """
-        # Get relation vectors for the whole batch, with shape (b, i)
-        rels_b_i = self.rel_vecs(rels)
+        # Get relation vectors for the whole batch, with shape (b, k)
+        rels_b_k = self.rel_vecs(rels)
         # Get left term vectors for the whole batch, with shape (b, L)
         terms_b_L = self.term_vecs(terms_L)
         # Get right term vectors for the whole batch, with shape (b, R)
         terms_b_R = self.term_vecs(terms_R)
 
         # Get the interaction of the terms in relation-embedding space, with
-        # shape (b, i).
-        inter_b_i = self.assoc_tensor(terms_b_L, terms_b_R)
+        # shape (b, k).
+        inter_b_k = self.assoc_tensor(terms_b_L, terms_b_R)
 
-        # Multiply our (b * i) term elementwise by rels_b_i. This indicates
+        # Multiply our (b * k) term elementwise by rels_b_k. This indicates
         # how well the interaction between term L and term R matches each
         # component of the relation vector.
-        relmatch_b_i = inter_b_i * rels_b_i
+        relmatch_b_k = inter_b_k * rels_b_k
 
         # Add up the components for each item in the batch
-        energy_b = torch.sum(relmatch_b_i, 1)
+        energy_b = torch.sum(relmatch_b_k, 1)
 
         return energy_b * self.truth_multiplier + self.truth_offset
 
@@ -447,7 +481,8 @@ class SemanticMatchingModel(nn.Module):
             edges,
             batch_size=2,
             convert_logits_to_probas=False,
-            device=None
+            device=None,
+            use_multiple_gpus=False
     ):
         """
         Given a SemanticMatchingModel and an iteratable of edges (in the form of 
@@ -462,8 +497,10 @@ class SemanticMatchingModel(nn.Module):
         to True.  If a device is specified (with the device parameter) then the 
         model will be moved to that device before scoring takes place; otherwise 
         the model will be moved to the device given by its device attribute (if not 
-        already there).  Edges are scored in batches, with a default size of 32 (which 
-        may be changed by setting the batch_size parameter).
+        already there).  After that, if use_multiple_gpus (default False) is 
+        set to True, the model will be parallelized across all available gpu's 
+        (using DataParalleizedModule).  Edges are scored in batches, with a default 
+        size of 2 (which may be changed by setting the batch_size parameter).
         """
         # If a device is specified, move the model there before applying it.
         # Regardless, input for the model will be constructed in batches on the
@@ -473,8 +510,16 @@ class SemanticMatchingModel(nn.Module):
             device = self.device
         self.to(device)
 
-        # Put the model in evaluation mode.
-        self.eval()
+        # Put the model on all available gpu's, if so requested.
+        parallel_model = DataParallelizedModule(
+            self,
+            device,
+            copy_fn=_model_copier,
+            parallelize=use_multiple_gpus)
+
+        # Put the model(s) in evaluation mode.
+        for model_copy in parallel_model.children:
+            model_copy.eval()
 
         # We'll batch the edges together before handing them to the model for
         # evaluation, for efficiency's sake.  As torch tensors are stored row-major,
@@ -513,7 +558,7 @@ class SemanticMatchingModel(nn.Module):
             # Handle a full batch buffer.
 
             input_batch_on_device = input_batch.cuda(device, non_blocking=True)
-            output_batch = self(
+            output_batch = parallel_model(
                 input_batch_on_device[0], input_batch_on_device[1], input_batch_on_device[2]
             )
             output_batch.detach_() # requiring grad prevents calling numpy()
@@ -529,7 +574,7 @@ class SemanticMatchingModel(nn.Module):
         
         if position_in_batch > 0:
             input_batch_on_device = input_batch.cuda(device, non_blocking=True)
-            output_batch = self(
+            output_batch = parallel_model(
                 input_batch_on_device[0, 0:position_in_batch],
                 input_batch_on_device[1, 0:position_in_batch],
                 input_batch_on_device[2, 0:position_in_batch]
@@ -561,23 +606,74 @@ class SemanticMatchingModel(nn.Module):
         for score, (rel, left, right) in self.score_edges(edge_iterator(input_filename), **kwargs):
             writer.write((rel, left, right, float(score)))
     
-    def show_debug(self, batch, energy, positive):
+    def predict_wrapper(self, relname, termname, forward=True, topk=10):
+        rel_idx = RELATION_INDEX.get_loc(relname)
+        term_idx = self.index.get_loc(termname)
+        best_terms, best_values = self.predict_terms(
+            torch.LongTensor([rel_idx]),
+            torch.LongTensor([term_idx]),
+            1, 0, forward=forward, topk=topk
+        )
+
+        best_terms = best_terms[0].cpu().numpy()
+        best_values = best_values[0].cpu().numpy()
+
+        best_term_names = self.index[best_terms]
+        return pd.DataFrame(best_values, index=best_term_names)
+
+    def predict_terms(self, rels, terms, nshards=1, offset=0, forward=True, topk=1):
+        with torch.no_grad():
+            # Indices here use different letters to represent different dimensions, like
+            # in Einstein notation.
+            #
+            # b: items in the batch
+            # k: relation vectors
+            # L and R: term vectors, distinguishing left terms from right terms
+            # T: one of L or R, whichever one we have as input
+            # m: terms in the subset of vocabulary we're using
+
+            # Get a subset of terms that we'll try to predict. This has dimensions (m x R),
+            # as it maps the vocabulary to term vectors.
+            lang = get_uri_language(self.index[terms[0]])
+            lang_indices = self.index_by_language[lang]
+            candidate_indices = torch.LongTensor([
+                idx for idx in lang_indices[offset::nshards]
+                if idx != int(terms[0])
+            ])
+
+            candidate_terms_m_T = self.term_vecs.weight[candidate_indices]
+
+            rels_b_k = self.rel_vecs(rels.to(self.device))
+            assoc_k_L_R = self.assoc_tensor.weight
+            terms_b_T = self.term_vecs(terms.to(self.device))
+
+            # And now that we've got all these indices in Einstein notation, we can use
+            # Einstein notation to describe exactly the operation that multiplies them,
+            # giving us a (b x m) batch of term predictions.
+            if forward:
+                predictions_b_m = torch.einsum('bk,bl,klr,mr->bm', (rels_b_k, terms_b_T, assoc_k_L_R, candidate_terms_m_T))
+            else:
+                predictions_b_m = torch.einsum('bk,br,klr,ml->bm', (rels_b_k, terms_b_T, assoc_k_L_R, candidate_terms_m_T))
+
+            best_values, best_indices = torch.topk(predictions_b_m, topk, dim=1)
+            best_terms_reindexed = torch.take(candidate_indices, best_indices.cpu())
+            return best_terms_reindexed, best_values
+
+    def show_debug(self, batch):
         """
         On certain iterations, we show the training examples and what the model
         believed about them.
         """
-        truth_values = energy
-        rel_indices, left_indices, right_indices = batch
-        if positive:
-            print("POSITIVE")
-        else:
-            print("\nNEGATIVE")
-        for i in range(len(energy)):
-            rel = RELATION_INDEX[int(rel_indices.data[i])]
-            left = self.index[int(left_indices.data[i])]
-            right = self.index[int(right_indices.data[i])]
-            value = truth_values.data[i]
-            print("[%4.4f] %s %s %s" % (value, rel, left, right))
+        rel_indices, left_indices, right_indices, weights, targets = batch
+        index_order = np.arange(len(weights))
+
+        for i in index_order:
+            rel = RELATION_INDEX[int(rel_indices[i])]
+            left = self.index[int(left_indices[i])]
+            right = self.index[int(right_indices[i])]
+            if get_uri_language(left) == 'en':
+                target = int(targets[i])
+                print(f'{target}  {rel:<20} {left:<20} {right:<20}')
 
     @staticmethod
     def load_initial_frame():
@@ -708,7 +804,7 @@ class SemanticMatchingModel(nn.Module):
 
 
 def clip_grad_norm(parameters, max_norm, norm_type=2):
-    r"""Clips gradient norm of an iterable of parameters, just like 
+    r"""Clips gradient norm of an iterable of parameters, just like
     nn.utils.clip_grad_norm_, but works even if some parameters are sparse.
 
     The norm is computed over all gradients together, as if they were
@@ -765,55 +861,55 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
 
 class DataParallelizedModule(nn.Module):
     """
-    Similarly to nn.DataParallel, this class of modules serves to wrap 
-    other modules and run them in parallel over multiple gpus, splitting 
-    training (or testing/application) batches between the gpus (over the 
-    first dimension of the batch, which is assumed to correspond to data 
-    points within the batch).  
-    
-    Unlike nn.DataParallel, all of the wrapped module's parameters will be 
-    copied to all gpus during construction of the wrapper, and only gradient 
-    data will be copied from gpu to gpu during training (no data should need 
-    to be copied between gpus during forward application).  However, training 
-    should only use loss functions that can be expressed as averages over all 
-    data points of a batch of some per-data-point loss.  Each training batch 
-    must be presented as a tuple of tensors all of which have equal sizes (or 
-    at least sizes in fixed proportions) in dimension 0 (corresponding to the 
-    points in the batch).  Also, the set of parameters of the wrapped module 
-    is assumed not to change (of course their values can change) over the 
+    Similarly to nn.DataParallel, this class of modules serves to wrap
+    other modules and run them in parallel over multiple gpus, splitting
+    training (or testing/application) batches between the gpus (over the
+    first dimension of the batch, which is assumed to correspond to data
+    points within the batch).
+
+    Unlike nn.DataParallel, all of the wrapped module's parameters will be
+    copied to all gpus during construction of the wrapper, and only gradient
+    data will be copied from gpu to gpu during training (no data should need
+    to be copied between gpus during forward application).  However, training
+    should only use loss functions that can be expressed as averages over all
+    data points of a batch of some per-data-point loss.  Each training batch
+    must be presented as a tuple of tensors all of which have equal sizes (or
+    at least sizes in fixed proportions) in dimension 0 (corresponding to the
+    points in the batch).  Also, the set of parameters of the wrapped module
+    is assumed not to change (of course their values can change) over the
     lifetime of the wrapper object.
-    
-    Note that during training of a wrapped module, it is necessary to call 
-    the wrapper's broadcast_gradients method immediately following the 
-    backpropagation of gradients (i.e. typically right after calling 
-    .backward on some loss tensor), in order to share corrections to the 
+
+    Note that during training of a wrapped module, it is necessary to call
+    the wrapper's broadcast_gradients method immediately following the
+    backpropagation of gradients (i.e. typically right after calling
+    .backward on some loss tensor), in order to share corrections to the
     computed gradients between the gpus.
-    
-    Specifically, if L is the average loss over an entire (mini-)batch, of 
-    size n data points, that batch is scattered over k gpus as chunks of 
-    sizes n_0, ..., n_(k-1) (with sum equal to n), and L_i is the average loss 
-    over the i-th chunk, then L = w_0 * L_0 + ... + w_k-1 * L_(k-1), where 
+
+    Specifically, if L is the average loss over an entire (mini-)batch, of
+    size n data points, that batch is scattered over k gpus as chunks of
+    sizes n_0, ..., n_(k-1) (with sum equal to n), and L_i is the average loss
+    over the i-th chunk, then L = w_0 * L_0 + ... + w_k-1 * L_(k-1), where
     w_i = n_i / n, and so for any parameter p
-    
+
         dL/dp = w_0 dL_0/dp + ... + w_(k-1) * dL_(k-1)/dp.
-    
-    The broadcast_gradients method collects the individual pieces of gradient 
-    data dL_i/dp from all the gpus, computes the unified gradient data dL/dp 
+
+    The broadcast_gradients method collects the individual pieces of gradient
+    data dL_i/dp from all the gpus, computes the unified gradient data dL/dp
     (for every parameter) and updates the gradients on every gpu.
     """
 
     def __init__(self, module, device, copy_fn, parallelize=True):
         """
-        Construct a parallelizing wrapper for the given module (an instance 
-        of nn.Module).  The module will be moved to the given device (if 
-        not already there) and copies will be made using the given copy 
-        function (which should accept a module and a device, and return a 
-        copy of the module suitable for placement on that device) and 
+        Construct a parallelizing wrapper for the given module (an instance
+        of nn.Module).  The module will be moved to the given device (if
+        not already there) and copies will be made using the given copy
+        function (which should accept a module and a device, and return a
+        copy of the module suitable for placement on that device) and
         moved to all other available gpus.
-        
-        If the (optional) parallelize argument is set to False, or if the 
-        requested device is the cpu, or if multiple gpus are not available, 
-        the model will be moved to the given device (if possible) for execution 
+
+        If the (optional) parallelize argument is set to False, or if the
+        requested device is the cpu, or if multiple gpus are not available,
+        the model will be moved to the given device (if possible) for execution
         there.
         """
         super().__init__()
@@ -878,9 +974,9 @@ class DataParallelizedModule(nn.Module):
 
     def forward(self, *args):
         """
-        Scatter the supplied args (assumed to be a list of tensors) across 
-        the child modules, and gather their outputs (assumed to be single 
-        tensors) back to the first gpu.  Also, accumulate the sizes of the 
+        Scatter the supplied args (assumed to be a list of tensors) across
+        the child modules, and gather their outputs (assumed to be single
+        tensors) back to the first gpu.  Also, accumulate the sizes of the
         scattered chunks (for later use in updating parameter gradients).
         """
         # Data is scattered into chunks by splitting on dimension 0.
@@ -930,7 +1026,7 @@ class DataParallelizedModule(nn.Module):
 
     def zero_grad(self):
         """
-        In addition to the ordinary zeroing of gradient data, reset the 
+        In addition to the ordinary zeroing of gradient data, reset the
         chunk size data.
         """
         super().zero_grad()
@@ -938,10 +1034,10 @@ class DataParallelizedModule(nn.Module):
 
     def broadcast_gradients(self):
         """
-        Compute a single value, for all the child modules, of the gradient 
-        of each module parameter (as a convex combination of the gradients 
-        in the individual children, with coefficients proportional to the 
-        batch chunk sizes from the forward computation), and distribute these 
+        Compute a single value, for all the child modules, of the gradient
+        of each module parameter (as a convex combination of the gradients
+        in the individual children, with coefficients proportional to the
+        batch chunk sizes from the forward computation), and distribute these
         common gradients back to all the children.
         """
         if len(self.children) <= 1:
@@ -993,13 +1089,13 @@ class DataParallelizedModule(nn.Module):
 
     def synchronize_children(self, tolerance=5e-6):
         """
-        In principle, if broadcast_gradients is called on every training step, 
-        the child modules should always agree on all parameters.  In practice, 
-        some optimizers sometimes introduce slight discrepancies (e.g. 
-        optim.SGD with sparse gradients, which does not coalesce such gradients 
-        at every step).  This method can be called periodically to reset the 
-        parameters of all children to the values of the first child (the 
-        original module), and to print warnings if the parameters have diverged 
+        In principle, if broadcast_gradients is called on every training step,
+        the child modules should always agree on all parameters.  In practice,
+        some optimizers sometimes introduce slight discrepancies (e.g.
+        optim.SGD with sparse gradients, which does not coalesce such gradients
+        at every step).  This method can be called periodically to reset the
+        parameters of all children to the values of the first child (the
+        original module), and to print warnings if the parameters have diverged
         by more than the given (absolute) tolerance.
         """
         msg = "Warning: {} differs between parallelized models by {}."
@@ -1022,17 +1118,30 @@ class DataParallelizedModule(nn.Module):
                 child_params[0].data = child_params[0].data.new_empty((0,))
                 child_params[0].data = param_data_cpu.to(device)
 
+def _model_copier(model, device):
+    """
+    Function to copy SemanticMatchingModels from one gpu to another, for use 
+    with DataParallelizedModule.
+    """
+    model.cpu()
+    frame = pd.DataFrame(model.term_vecs.weight.data.numpy(), index=model.index)
+    new_model = SemanticMatchingModel(frame, use_cuda=False)
+    new_model.load_state_dict(model.state_dict())
+    new_model.device = device
+    new_model.to(device)
+    return new_model
+
 
 def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False,
                 validation_dataset=None):
     """
     Incrementally train the model on the given dataset.
 
-    If a positive number of batch worker processes is requested, generation 
-    of training data batches will be done in parallel across multiple CPU cores 
+    If a positive number of batch worker processes is requested, generation
+    of training data batches will be done in parallel across multiple CPU cores
     by spawning that number of child processes.
 
-    If use of multiple GPUs is requested (and they are available), evaluation 
+    If use of multiple GPUs is requested (and they are available), evaluation
     of batches will be parallelized across all available GPUs.
 
     If a validation dataset is given, every 5000 training batch iterations 
@@ -1047,42 +1156,11 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False,
     model.train()
 
     print("Making parallelized model.")
-    def model_copier(model, device):
-        model.cpu()
-        frame = pd.DataFrame(model.term_vecs.weight.data.numpy(), index=model.index)
-        new_model = SemanticMatchingModel(frame, use_cuda=False)
-        new_model.load_state_dict(model.state_dict())
-        new_model.device = device
-        new_model.to(device)
-        return new_model
 
-    parallel_model = DataParallelizedModule(model, model.device, copy_fn=model_copier, parallelize=use_multiple_gpus)
-
-    # Relative loss says that the positive examples should outrank their
-    # corresponding negative examples, with a difference of at least 1
-    # logit between them. If the difference is less than this (especially
-    # if it's negative), this adds to the relative loss.
-    print("Making loss functions.")
-    relative_loss_function = nn.MarginRankingLoss(margin=1)
-
-    # Absolute loss measures the cross-entropy of the predictions:
-    # true statements should get positive values, false statements should
-    # get negative values, and the sigmoid of those values should be a
-    # probability that accurately reflects the model's confidence.
-    absolute_loss_function = nn.BCEWithLogitsLoss()
+    parallel_model = DataParallelizedModule(model, model.device, copy_fn=_model_copier, parallelize=use_multiple_gpus)
 
     print("Making optimizer.")
     optimizer = optim.SGD(parallel_model.parameters(), lr=0.1)
-    losses = []
-
-    print("Making loss targets.")
-    true_target = torch.ones(
-        [BATCH_SIZE], dtype=torch.float32, device=parallel_model.device
-    )
-    false_target = torch.zeros(
-        [BATCH_SIZE], dtype=torch.float32, device=parallel_model.device
-    )
-    steps = 0
 
     # Note that you want drop_last=False with a CyclingSampler.
     print("Making data loader.")
@@ -1112,34 +1190,23 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False,
         # infinite) this iterator will never raise StopIteration.
         validation_data_iterator = iter(validation_data_loader)
 
+    losses = []
+    steps = 0
+
     print("Entering training (batch) loop.")
-    for pos_batch, neg_batch, weights in data_loader:
+    for batch in data_loader:
         if parallel_model.device != torch.device("cpu"):
-            pos_batch = tuple(
+            batch = tuple(
                 x.cuda(device=parallel_model.device, non_blocking=True)
-                for x in pos_batch
+                for x in batch
             )
-            neg_batch = tuple(
-                x.cuda(device=parallel_model.device, non_blocking=True)
-                for x in neg_batch
-            )
-            weights = weights.cuda(device=parallel_model.device, non_blocking=True)
 
         parallel_model.zero_grad()
+        rels, lefts, rights, weights, targets = batch
 
-        pos_energy = parallel_model(*pos_batch)
-        neg_energy = parallel_model(*neg_batch)
-
-        abs_loss = absolute_loss_function(pos_energy, true_target)
-        rel_loss = 0
-        for neg_index in range(NEG_SAMPLES):
-            neg_energy_slice = neg_energy[neg_index::NEG_SAMPLES]
-            rel_loss += relative_loss_function(
-                pos_energy, neg_energy_slice, true_target
-            )
-            abs_loss += absolute_loss_function(neg_energy_slice, false_target)
-
-        loss = abs_loss + rel_loss
+        energy = parallel_model(rels, lefts, rights)
+        loss_function = nn.BCEWithLogitsLoss(weight=weights)
+        loss = loss_function(energy, targets)
         loss.backward()
 
         parallel_model.broadcast_gradients()
@@ -1155,12 +1222,11 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False,
         steps += 1
 
         if steps in (1, 10, 20, 50, 100) or steps % 100 == 0:
-            model.show_debug(neg_batch, neg_energy, False)
-            model.show_debug(pos_batch, pos_energy, True)
+            # model.show_debug(batch, energy)
             avg_loss = np.mean(losses)
             print(
-                "%d steps, loss=%4.4f, abs=%4.4f, rel=%4.4f"
-                % (steps, avg_loss, abs_loss, rel_loss)
+                "%d steps, loss=%4.4f"
+                % (steps, avg_loss)
             )
             losses.clear()
 
@@ -1203,31 +1269,19 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False,
                 # Take the specified number of batches from the validation
                 # dataset via the data (loader) iterator.
                 for _ in range(n_validation_batches):
-                    pos_batch, neg_batch, weights = next(validation_data_iterator)
+                    batch = next(validation_data_iterator)
                     if parallel_model.device != torch.device("cpu"):
-                        pos_batch = tuple(
+                        batch = tuple(
                             x.cuda(device=parallel_model.device, non_blocking=True)
-                            for x in pos_batch
+                            for x in batch
                         )
-                        neg_batch = tuple(
-                            x.cuda(device=parallel_model.device, non_blocking=True)
-                            for x in neg_batch
-                        )
-                        weights = weights.cuda(device=parallel_model.device, non_blocking=True)
 
-                    pos_energy = parallel_model(*pos_batch)
-                    neg_energy = parallel_model(*neg_batch)
+                    rels, lefts, rights, weights, targets = batch
 
-                    abs_loss = absolute_loss_function(pos_energy, true_target)
-                    rel_loss = 0
-                    for neg_index in range(NEG_SAMPLES):
-                        neg_energy_slice = neg_energy[neg_index::NEG_SAMPLES]
-                        rel_loss += relative_loss_function(
-                            pos_energy, neg_energy_slice, true_target
-                        )
-                        abs_loss += absolute_loss_function(neg_energy_slice, false_target)
-
-                    validation_loss += abs_loss + rel_loss
+                    energy = parallel_model(rels, lefts, rights)
+                    loss_function = nn.BCEWithLogitsLoss(weight=weights)
+                    loss = loss_function(energy, targets)
+                    validation_loss += loss
                 
                 validation_loss /= n_validation_batches  # mean over batches
                 validation_loss = validation_loss.data.cpu().item()
@@ -1272,7 +1326,7 @@ if __name__ == "__main__":
     print("Initializing edge dataset ....")
     dataset_accumulator = TimeAccumulator()
     with stopwatch(dataset_accumulator):
-        dataset = EdgeDataset(EDGES_FILENAME, model.index)
+        dataset = EdgeDataset(EDGES_FILENAME, model)
     dataset_accumulator.print("Edge dataset initialization took",
                               accumulated_time=0.0)
     print("Edge dataset contains {} edges.".format(len(dataset)))
@@ -1280,8 +1334,8 @@ if __name__ == "__main__":
     if os.path.isfile(VALIDATION_FILENAME):
         print("Initializing validation dataset ....")
         with stopwatch(dataset_accumulator):
-            validation_dataset = EdgeDataset(VALIDATION_FILENAME, model.index)
+            validation_dataset = EdgeDataset(VALIDATION_FILENAME, model)
         dataset_accumulator.print("Validation dataset initialization took")
         print("Validation dataset contains {} edges.".format(len(validation_dataset)))
     train_model(model, dataset, num_batch_workers=NUM_BATCH_WORKERS, use_multiple_gpus=USE_MULTIPLE_GPUS, validation_dataset=validation_dataset)
-    # model.evaluate_conceptnet(dataset)
+    # model.evaluate_conceptnet(EDGES_FILENAME)
