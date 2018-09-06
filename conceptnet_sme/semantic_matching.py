@@ -29,6 +29,7 @@ import random
 import pathlib
 import os
 import contextlib
+import datetime
 import time
 
 from conceptnet_sme.relations import (
@@ -50,6 +51,7 @@ INITIAL_VECS_FILENAME = get_data_filename("vectors/numberbatch.h5")
 EDGES_FILENAME = get_data_filename("collated/sorted/edges-shuf.csv")
 VALIDATION_FILENAME = get_data_filename("collated/sorted/edges-shuf-validation.csv")
 MODEL_FILENAME = get_data_filename("sme/sme.model")
+LOG_FILENAME = get_data_filename("sme/sme.log")
 NEG_SAMPLES = 5
 ADVERSARIAL_SAMPLES = 3
 PREDICT_SHARDS = 100
@@ -76,6 +78,27 @@ LANGUAGES_TO_USE = [
 BATCH_SIZE = 160
 
 random.seed(0)
+
+
+class _MessageWriter:
+    def __init__(self, filename=LOG_FILENAME):
+        self.file = open(filename, 'at', encoding='utf-8')
+        timestamp = datetime.datetime.utcnow().isoformat()
+        print("Logging started at {}".format(timestamp), file=self.file)
+
+    def __del__(self):
+        self.file.close()
+
+    def write(self, msg):
+        print(msg, file=self.file)
+
+_message_writer = None
+
+def log_message(msg):
+    global _message_writer
+    print(msg)
+    if _message_writer is not None:
+        _message_writer.write(msg)
 
 
 def coin_flip():
@@ -143,7 +166,7 @@ class TimeAccumulator:
         return
 
     def print(self, caption, accumulated_time=None):
-        print("{} {} sec.".format(caption, self.accumulated_time))
+        log_message("{} {} sec.".format(caption, self.accumulated_time))
         if accumulated_time is not None:
             self.accumulated_time = accumulated_time
         return
@@ -176,7 +199,7 @@ class EdgeDataset(Dataset):
 
         for count, (rel, left, right, weight) in enumerate(self.iter_edges_once()):
             if count % 500000 == 0 and count > 0:
-                print("Read {} edges.".format(count))
+                log_message("Read {} edges.".format(count))
             if rel not in COMMON_RELATIONS:
                 continue
             if not ENTAILED_INDICES[rel]:
@@ -204,7 +227,7 @@ class EdgeDataset(Dataset):
 
             weights.append(weight)
         if len(rel_indices) < 1:
-            print("No edges survived filtering; fitting is impossible!")
+            log_message("No edges survived filtering; fitting is impossible!")
             raise ValueError
         self.rel_indices = torch.LongTensor(rel_indices)
         self.left_indices = torch.LongTensor(left_indices)
@@ -372,7 +395,7 @@ class SemanticMatchingModel(nn.Module):
         # Initialize term embeddings, including the index that converts terms
         # from strings to row numbers and the index converting relations to
         # row numbers in the relation vector embedding.
-        print("Intializing term embeddings.")
+        log_message("Intializing term embeddings.")
         self.index = frame.index
         n_frame_terms, term_dim = frame.values.shape
         self.term_vecs = nn.Embedding(n_frame_terms, term_dim, sparse=True)
@@ -393,12 +416,12 @@ class SemanticMatchingModel(nn.Module):
         # PyTorch convention is that inputs come before outputs, but the
         # resulting tensor is (k_2 x k_1 x k_1) because the math convention
         # is that outputs are on the left.
-        print("Initializing association tensor and relation embedding.")
+        log_message("Initializing association tensor and relation embedding.")
         self.assoc_tensor = nn.Bilinear(term_dim, term_dim, relation_dim, bias=True)
         self.rel_vecs = nn.Embedding(N_RELS, relation_dim, sparse=True)
 
         # Using CUDA to run on the GPU requires different data types
-        print("Setting model device (cpu/gpu).")
+        log_message("Setting model device (cpu/gpu).")
         if use_cuda and torch.cuda.is_available():
             self.device = torch.device("cuda:0")
         else:
@@ -406,7 +429,7 @@ class SemanticMatchingModel(nn.Module):
 
         # Create (and register) the identity tensor used to reset the synonym
         # relation.  (Register it so it will be included in the state dict.)
-        print("Initializing identity slice.")
+        log_message("Initializing identity slice.")
         self.register_buffer(
             "identity_slice",
             torch.tensor(np.eye(term_dim), dtype=torch.float32, device=self.device),
@@ -417,7 +440,7 @@ class SemanticMatchingModel(nn.Module):
         # These are used to convert the tensor products linearly into logits.
         # The initial values of these are set to numbers that appeared
         # reasonable based on a previous run.
-        print("Initializing logit scale factors.")
+        log_message("Initializing logit scale factors.")
         self.truth_multiplier = nn.Parameter(
             torch.tensor(5.0, dtype=torch.float32)
         )
@@ -426,7 +449,7 @@ class SemanticMatchingModel(nn.Module):
         )
 
         # Make sure everything is on the right device.
-        print("Moving model to selected device (cpu/gpu).")
+        log_message("Moving model to selected device (cpu/gpu).")
         self.to(self.device)
 
     def reset_synonym_relation(self):
@@ -682,11 +705,11 @@ class SemanticMatchingModel(nn.Module):
         """
         total_accum = TimeAccumulator()
         incremental_accum = TimeAccumulator()
-        print("Loading frame from file {}.".format(INITIAL_VECS_FILENAME))
+        log_message("Loading frame from file {}.".format(INITIAL_VECS_FILENAME))
         with stopwatch(total_accum), stopwatch(incremental_accum):
             frame = load_hdf(INITIAL_VECS_FILENAME)
         incremental_accum.print("Reading frame from file took", accumulated_time=0.0)
-        print("Filtering terms in frame by language.")
+        log_message("Filtering terms in frame by language.")
         with stopwatch(total_accum), stopwatch(incremental_accum):
             labels = [
                 label
@@ -695,7 +718,7 @@ class SemanticMatchingModel(nn.Module):
             ]
             frame = frame.loc[labels]
         incremental_accum.print("Filtering took", accumulated_time=0.0)
-        print("Casting frame to float32.")
+        log_message("Casting frame to float32.")
         with stopwatch(total_accum), stopwatch(incremental_accum):
             frame = frame.astype(np.float32)
         incremental_accum.print("Casting took", accumulated_time=0.0)
@@ -710,14 +733,14 @@ class SemanticMatchingModel(nn.Module):
         """
         total_accum = TimeAccumulator()
         incremental_accum = TimeAccumulator()
-        print("Loading model from file {}.".format(filename))
+        log_message("Loading model from file {}.".format(filename))
         with stopwatch(total_accum):
             frame = SemanticMatchingModel.load_initial_frame()
-        print("Constructing model from frame.")
+        log_message("Constructing model from frame.")
         with stopwatch(total_accum), stopwatch(incremental_accum):
             model = SemanticMatchingModel(frame, use_cuda=use_cuda)
         incremental_accum.print("Constructing model took", accumulated_time=0.0)
-        print("Restoring model state from file.")
+        log_message("Restoring model state from file.")
         with stopwatch(total_accum), stopwatch(incremental_accum):
             # We have adopted the convention that models are moved to the
             # cpu before saving their state (as else loading would need
@@ -729,6 +752,22 @@ class SemanticMatchingModel(nn.Module):
         incremental_accum.print("Restoring took", accumulated_time=0.0)
         total_accum.print("Total time to load model:")
         return model
+
+    def evaluate_edge(self, rel_idx, left_idx, right_idx):
+        """
+        Return the value assigned by the (presumably trained) model to the 
+        edge with the given relation, left, and right term indices.
+        """
+        rel_tensor = torch.tensor([rel_idx], dtype=torch.int64, device=self.device)
+        left_tensor = torch.tensor(
+            [left_idx], dtype=torch.int64, device=self.device
+        )
+        right_tensor = torch.tensor(
+            [right_idx], dtype=torch.int64, device=self.device
+        )
+        model_output = self(rel_tensor, left_tensor, right_tensor)
+        value = model_output.item()
+        return value
 
     def evaluate_conceptnet(self, input_file, cutoff_value=-1, output_filename=None):
         """
@@ -753,22 +792,139 @@ class SemanticMatchingModel(nn.Module):
                 except KeyError:
                     continue
 
-                rel_tensor = torch.tensor([rel_idx], dtype=torch.int64, device=self.device)
-                left_tensor = torch.tensor(
-                    [left_idx], dtype=torch.int64, device=self.device
-                )
-                right_tensor = torch.tensor(
-                    [right_idx], dtype=torch.int64, device=self.device
-                )
-
-                model_output = self(rel_tensor, left_tensor, right_tensor)
-
-                value = model_output.item()
+                value = self.evaluate_edge(rel_idx, left_idx, right_idx)
                 assertion = assertion_uri(rel, left, right)
                 if value < cutoff_value:
                     print("%4.4f\t%s" % (value, assertion))
                 if out is not None:
                     print("%4.4f\t%s" % (value, assertion), file=out)
+
+    def evaluate_statistics(self, input_filename, output_filename=None,
+                            n_edges=-1, n_perturbations_per_edge=99, random_state=None):
+        """
+        Read edges from the given input file, compute figures of merit based 
+        on the (presumably trained) model's preditions compared to those edges, 
+        or to a sample of them, print a summary of the results to stdout, and, 
+        if an output filename is given, to that file (in json format).  
+        
+        The number of edges in the sample to use is given by the parameter 
+        n_edges (default -1, meaning use all the edges, i.e. do not sample).
+        
+        For each edge in the sample, a set (of size n_perturbations_per_edge, 
+        default 99) of perturbations of that edge is generated by randomly 
+        altering either the left or right term (chosen with probability 1/2) 
+        to another term from the model's index of terms (chosen uniformly at 
+        random).  The quantile of the original edge's value as assigned by the 
+        model among all the values assigned to perturbations not in the input 
+        file is computed.  The statistics reported are the median and mean, 
+        over all edges of the sample, of this quantile, and the fraction of 
+        edges of the sample for which the quantile is at least 90% ("precision 
+        at 10%").  Also, we compute the excess of the score value assigned by 
+        the model to each of the orignal edges over the median score of its 
+        perturbations, and report the 10th, 50th, and 90th percentiles (over 
+        all the original edges) of this excess score.
+        
+        The random state used for sampling (and perturbation) may be specified 
+        as the value of the parameter random_state; if unspecified a non-determnistic 
+        seed will be used.
+        """
+        self.eval()
+        if random_state is None:
+            random_state = np.random.RandomState()
+        elif isinstance(random_state, int):
+            random_state = np.random.RandomState(random_state)
+
+        print("Reading edge file.")
+        edge_set = set()
+        edge_list = []
+        with open(input_filename, 'rt', encoding='utf-8') as fp:
+            if (len(edge_list) + 1) % 500000 == 0:
+                print("Reading edge {}".format(len(edge_list) + 1))
+            for line in fp:
+                _assertion, rel, left, right, _rest = line.split("\t", 4)
+                try:
+                    rel_idx = RELATION_INDEX.get_loc(rel)
+                    left_idx = self.index.get_loc(left)
+                    right_idx = self.index.get_loc(right)
+                except KeyError:
+                    continue
+                edge_set.add((rel_idx, left_idx, right_idx))
+                edge_list.append((rel_idx, left_idx, right_idx))
+
+        if not 0 <= n_edges <= len(edge_set):
+            n_edges = len(edges)
+
+        print("Compiling statistics.")
+        quantiles = []
+        precision_at_10_count = 0
+        n_totals = []
+        excesses_over_median = []
+        for i_edge in range(n_edges):
+            if (i_edge + 1) % 500 == 0:
+                print("Processing edge {} (of {}).".format(i_edge + 1, n_edges))
+            rel_idx, left_idx, right_idx = edge_list[random_state.choice(len(edge_list))]
+            value = self.evaluate_edge(rel_idx, left_idx, right_idx)
+            n_bad_below = 0
+            n_total = 1 # count the original edge
+            new_values = []
+            for i_new_edge in range(n_perturbations_per_edge):
+                new_term_idx = random_state.choice(len(self.index))
+                if random_state.choice(2) == 0:
+                    new_edge = (rel_idx, new_term_idx, right_idx)
+                else:
+                    new_edge = (rel_idx, left_idx, new_term_idx)
+                if new_edge in edge_set:
+                    continue
+                n_total += 1
+                new_value = self.evaluate_edge(*new_edge)
+                new_values.append(new_value)
+                if new_value < value:
+                    n_bad_below += 1
+            quantile = float(n_bad_below) / float(n_total) 
+            quantiles.append(quantile)
+            if quantile >= 0.9:
+                precision_at_10_count += 1
+            n_totals.append(n_total)
+            median_new_value = np.median(new_values)
+            excess_over_median = value - median_new_value
+            excesses_over_median.append(excess_over_median)
+
+        median_quantile = np.median(quantiles)
+        mean_quantile = np.mean(quantiles)
+        precision_at_10 = precision_at_10_count / n_edges
+        median_n_totals = np.median(n_totals)
+        mean_n_totals = np.mean(n_totals)
+        quantiles_of_excess_over_median = np.percentile(excesses_over_median, [10, 50, 90])
+
+        print("Number of true edges examined is {}.".format(n_edges))
+        print("Number of generated edges per true edge is {}.".format(
+            n_perturbations_per_edge))
+        print("Median total number of edges compared to compute quantiles is {}.".format(
+            median_n_totals))
+        print("Mean total number of edges compared to compute quantiles is {}.".format(
+            mean_n_totals))
+        print("Median quantile is {}.".format(median_quantile))
+        print("Mean quantile is {}.".format(mean_quantile))
+        print("Precision @ 10% is {}.".format(precision_at_10))
+        print("10th percentile of excess of known positive edge score over median perturbed edge score is {}".format(
+            quantiles_of_excess_over_median[0]))
+        print("50th percentile of excess of known positive edge score over median perturbed edge score is {}".format(
+            quantiles_of_excess_over_median[1]))
+        print("90th percentile of excess of known positive edge score over median perturbed edge score is {}".format(
+            quantiles_of_excess_over_median[2]))
+
+        if output_filename is not None:
+            import json
+            with open(output_filename, 'wt', encoding='utf-8') as fp:
+                json.dump(dict(median_quantile=median_quantile,
+                               mean_quantile=mean_quantile,
+                               n_edges=n_edges,
+                               n_perturbations_per_edge=n_perturbations_per_edge,
+                               precision_at_10=precision_at_10,
+                               q10_of_excess=quantiles_of_excess_over_median[0],
+                               q50_of_excess=quantiles_of_excess_over_median[1],
+                               q90_of_excess=quantiles_of_excess_over_median[2]),
+                          fp)
 
     def export(self, dirname):
         """
@@ -801,62 +957,6 @@ class SemanticMatchingModel(nn.Module):
         related_mat = (related_mat + related_mat.T) / 2
         related_terms = term_frame.dot(related_mat)
         save_hdf(related_terms, str(path / "terms-related.h5"))
-
-
-def clip_grad_norm(parameters, max_norm, norm_type=2):
-    r"""Clips gradient norm of an iterable of parameters, just like
-    nn.utils.clip_grad_norm_, but works even if some parameters are sparse.
-
-    The norm is computed over all gradients together, as if they were
-    concatenated into a single vector. Gradients are modified in-place.
-
-    Arguments:
-        parameters (Iterable[Tensor]): an iterable of Tensors that will have
-            gradients normalized
-        max_norm (float or int): max norm of the gradients
-        norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
-            infinity norm.
-
-    Returns:
-        Total norm of the parameters (viewed as a single vector).
-    """
-    # Torch sparse tensors may be stored un-coalesced (i.e., there can be
-    # more than one value assigned to each non-zero entry; the actual
-    # value of the tensor at that entry is the sum of those assigned values).
-    # Before computing the norm of a sparse tensor it must be coalesced, and
-    # after that it is only necessary to iterate over the non-zero entries to
-    # find the norm.
-    parameters = list(filter(lambda p: p.grad is not None, parameters))
-    max_norm = float(max_norm)
-    norm_type = float(norm_type)
-    if norm_type == float("inf"):
-
-        def L_inf_norm(tensor):
-            if tensor.layout == torch.sparse_coo:
-                if tensor._nnz() > 0:
-                    return tensor.coalesce()._values().abs().max()
-                else:
-                    return 0.0
-            else:
-                return tensor.abs().max()
-
-        total_norm = max(L_inf_norm(p.grad.data) for p in parameters)
-    else:
-        total_norm = 0
-        for p in parameters:
-            if p.grad.data.layout == torch.sparse_coo:
-                param_norm = p.grad.data.coalesce()._values().norm(norm_type)
-            else:
-                param_norm = p.grad.data.norm(norm_type)
-            total_norm += param_norm ** norm_type
-        total_norm = total_norm ** (1. / norm_type)
-    clip_coef = float(max_norm / (total_norm + 1e-6))
-    if clip_coef < 1:
-        for p in parameters:
-            p.grad.data.mul_(clip_coef)
-            if p.grad.data.layout == torch.sparse_coo:
-                p.grad.data = p.grad.data.coalesce()
-    return total_norm
 
 
 class DataParallelizedModule(nn.Module):
@@ -1113,7 +1213,7 @@ class DataParallelizedModule(nn.Module):
                 # Find its difference from the param on the first child.
                 difference = torch.norm(param_data_cpu - child_params[0].data.cpu())
                 if difference > tolerance:
-                    print(msg.format(name, difference))
+                    log_message(msg.format(name, difference))
                 # Copy the param to the child (but first free up space).
                 child_params[0].data = child_params[0].data.new_empty((0,))
                 child_params[0].data = param_data_cpu.to(device)
@@ -1144,26 +1244,26 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False,
     If use of multiple GPUs is requested (and they are available), evaluation
     of batches will be parallelized across all available GPUs.
 
-    If a validation dataset is given, every 5000 training batch iterations 
+    If a validation dataset is given, every 1000 training batch iterations 
     the loss over 50 batches from this dataset (which should be distinct 
     from the training data) will be printed.
 
     As it is, this function will never return. It writes the results so far
-    to `sme/sme.model` every 5000 iterations, and you can run it for as
+    to `sme/sme.model` every 1000 iterations, and you can run it for as
     long as you want.
     """
-    print("Starting model training.")
+    log_message("Starting model training.")
     model.train()
 
-    print("Making parallelized model.")
+    log_message("Making parallelized model.")
 
     parallel_model = DataParallelizedModule(model, model.device, copy_fn=_model_copier, parallelize=use_multiple_gpus)
 
-    print("Making optimizer.")
+    log_message("Making optimizer.")
     optimizer = optim.SGD(parallel_model.parameters(), lr=0.1)
 
     # Note that you want drop_last=False with a CyclingSampler.
-    print("Making data loader.")
+    log_message("Making data loader.")
     data_loader = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
@@ -1193,7 +1293,7 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False,
     losses = []
     steps = 0
 
-    print("Entering training (batch) loop.")
+    log_message("Entering training (batch) loop.")
     for batch in data_loader:
         if parallel_model.device != torch.device("cpu"):
             batch = tuple(
@@ -1211,7 +1311,7 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False,
 
         parallel_model.broadcast_gradients()
         for model_copy in parallel_model.children:
-            clip_grad_norm(model_copy.parameters(), 1)
+            nn.utils.clip_grad_norm_(model_copy.parameters(), 1)
 
         optimizer.step()
 
@@ -1222,17 +1322,16 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False,
         steps += 1
 
         if steps in (1, 10, 20, 50, 100) or steps % 100 == 0:
-            # model.show_debug(batch, energy)
             avg_loss = np.mean(losses)
-            print(
+            log_message(
                 "%d steps, loss=%4.4f"
                 % (steps, avg_loss)
             )
             losses.clear()
 
-        if steps % 5000 == 0:
+        if steps % 1000 == 0:
             incremental_accum = TimeAccumulator()
-            print("Saving model.")
+            log_message("Saving model.")
             with stopwatch(incremental_accum):
                 model.cpu()
             incremental_accum.print("Moving model to cpu took", accumulated_time=0.0)
@@ -1243,7 +1342,7 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False,
             with stopwatch(incremental_accum):
                 model.to(model.device)
             incremental_accum.print("Moving model back to its device took", accumulated_time=0.0)
-            print("saved")
+            log_message("saved")
 
             # With optim.SGD as the optimizer and when the model is
             # parallelized across multiple GPU's we see slight divergences
@@ -1252,7 +1351,7 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False,
             # every training iteration.)  So we force agreement between the
             # children periodically.
 
-            print("Synchronizing parallel model.")
+            log_message("Synchronizing parallel model.")
             with stopwatch(incremental_accum):
                 parallel_model.synchronize_children()
             incremental_accum.print("Synchonizing took", accumulated_time=0.0)
@@ -1260,7 +1359,7 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False,
             # If a validation dataset was given, show the loss over (some of)
             # the validation data.
             if validation_dataset is not None:
-                print("Evaluating loss over validation data.")
+                log_message("Evaluating loss over validation data.")
                 model.eval()  # turn off training mode temporarily
                 n_validation_batches = 50
                 validation_loss = torch.tensor(0, dtype=torch.float32,
@@ -1285,13 +1384,13 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False,
                 
                 validation_loss /= n_validation_batches  # mean over batches
                 validation_loss = validation_loss.data.cpu().item()
-                print("Validation loss (mean over {} batches) is {}.".format(
+                log_message("Validation loss (mean over {} batches) is {}.".format(
                     n_validation_batches,
                     validation_loss
                 ))
                 model.train()  # reset to train mode
                 
-    print()
+    log_message()
 
 
 def get_model():
@@ -1300,19 +1399,19 @@ def get_model():
     by creating it from scratch if nothing is there.
     """
     if os.access(MODEL_FILENAME, os.F_OK):
-        print("Loading previously saved model.")
+        log_message("Loading previously saved model.")
         model = SemanticMatchingModel.load_model(MODEL_FILENAME)
     else:
-        print("Creating a new model.")
+        log_message("Creating a new model.")
         total_accum = TimeAccumulator()
         incremental_accum = TimeAccumulator()
         with stopwatch(total_accum):
             frame = SemanticMatchingModel.load_initial_frame()
-        print("Normalizing initial frame.")
+        log_message("Normalizing initial frame.")
         with stopwatch(total_accum), stopwatch(incremental_accum):
             frame = l2_normalize_rows(frame)
         incremental_accum.print('Normalizing frame took', accumulated_time=0.0)
-        print('Constructing model from frame.')
+        log_message('Constructing model from frame.')
         with stopwatch(total_accum), stopwatch(incremental_accum):
             model = SemanticMatchingModel(frame)
         incremental_accum.print("Construction took", accumulated_time=0.0)
@@ -1321,21 +1420,23 @@ def get_model():
 
 
 if __name__ == "__main__":
-    print("Starting semantic matching.")
+    _message_writer = _MessageWriter()
+    log_message("Starting semantic matching.")
     model = get_model()
-    print("Initializing edge dataset ....")
+    log_message("Initializing edge dataset ....")
     dataset_accumulator = TimeAccumulator()
     with stopwatch(dataset_accumulator):
         dataset = EdgeDataset(EDGES_FILENAME, model)
     dataset_accumulator.print("Edge dataset initialization took",
                               accumulated_time=0.0)
-    print("Edge dataset contains {} edges.".format(len(dataset)))
+    log_message("Edge dataset contains {} edges.".format(len(dataset)))
     validation_dataset = None
     if os.path.isfile(VALIDATION_FILENAME):
-        print("Initializing validation dataset ....")
+        log_message("Initializing validation dataset ....")
         with stopwatch(dataset_accumulator):
             validation_dataset = EdgeDataset(VALIDATION_FILENAME, model)
         dataset_accumulator.print("Validation dataset initialization took")
-        print("Validation dataset contains {} edges.".format(len(validation_dataset)))
+        log_message("Validation dataset contains {} edges.".format(len(validation_dataset)))
     train_model(model, dataset, num_batch_workers=NUM_BATCH_WORKERS, use_multiple_gpus=USE_MULTIPLE_GPUS, validation_dataset=validation_dataset)
     # model.evaluate_conceptnet(EDGES_FILENAME)
+    del _message_writer
