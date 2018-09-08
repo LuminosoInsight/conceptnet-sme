@@ -15,6 +15,7 @@ from collections import defaultdict
 
 from conceptnet5.uri import uri_prefix
 from semantic_matching import SemanticMatchingModel, stopwatch, TimeAccumulator
+from conceptnet5.util import get_data_filename
 
 def read_edges(root):
     """
@@ -172,7 +173,6 @@ def load_composite_scores(path):
 
 
 if __name__ == '__main__':
-    from conceptnet5.util import get_data_filename
     accumulator = TimeAccumulator()
     edges_filename = get_data_filename('collated/sorted/edges-shuf.csv')
     vectors_filename = get_data_filename('vectors/numberbatch-biased.h5')

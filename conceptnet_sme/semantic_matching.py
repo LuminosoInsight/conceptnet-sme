@@ -31,6 +31,7 @@ import os
 import contextlib
 import datetime
 import time
+import itertools
 
 from conceptnet_sme.relations import (
     COMMON_RELATIONS,
@@ -502,15 +503,17 @@ class SemanticMatchingModel(nn.Module):
     def score_edges(
             self,
             edges,
-            batch_size=2,
+            batch_size=32,
             convert_logits_to_probas=False,
             device=None,
-            use_multiple_gpus=False
+            use_multiple_gpus=False,
+            edges_given_as_indices=False
     ):
         """
         Given a SemanticMatchingModel and an iteratable of edges (in the form of 
         tuples starting with a relation, a left endpoint, and a right endpoint, 
-        where the endpoints have been run through uri_prefix), return an iterator 
+        or, if the argument edges_given_as_indices equals True, as triples of 
+        relation, left- and right-endpoint indices), return an iterator 
         yielding the same tuples paired with the model's scores to the edge, 
         for all of the given edges whose endpoints are present in the model's 
         term index and whose relation is in the model's relation index.
@@ -523,7 +526,7 @@ class SemanticMatchingModel(nn.Module):
         already there).  After that, if use_multiple_gpus (default False) is 
         set to True, the model will be parallelized across all available gpu's 
         (using DataParalleizedModule).  Edges are scored in batches, with a default 
-        size of 2 (which may be changed by setting the batch_size parameter).
+        size of 32 (which may be changed by setting the batch_size parameter).
         """
         # If a device is specified, move the model there before applying it.
         # Regardless, input for the model will be constructed in batches on the
@@ -556,16 +559,18 @@ class SemanticMatchingModel(nn.Module):
 
         position_in_batch = 0
         for edge in edges:
-            # Translate the string fields of the edge to indices the model knows.
-            rel = edge[0]
-            left = edge[1]
-            right = edge[2]
-            try:
-                rel_idx = RELATION_INDEX.get_loc(rel)
-                left_idx = self.index.get_loc(left)
-                right_idx = self.index.get_loc(right)
-            except KeyError:
-                continue # the model can't handle this edge
+            # Translate the string fields of the edge to indices the model knows,
+            # if necessary.
+            if edges_given_as_indices:
+                rel_idx, left_idx, right_idx = edge[:3]
+            else:
+                rel, left, right = edge[:3]
+                try:
+                    rel_idx = RELATION_INDEX.get_loc(rel)
+                    left_idx = self.index.get_loc(left)
+                    right_idx = self.index.get_loc(right)
+                except KeyError:
+                    continue # the model can't handle this edge
 
             # Insert the new edge's data into the growing batch.
             input_batch[0, position_in_batch] = rel_idx
@@ -594,13 +599,16 @@ class SemanticMatchingModel(nn.Module):
             input_batch_edges = []
 
         # Handle any final (shorter than normal) batch.
+        # Note that we evaluate a full-size batch in case the actual size
+        # is not divisible by the number of gpu's in use.  But we only
+        # return the legitimate data.
         
         if position_in_batch > 0:
             input_batch_on_device = input_batch.cuda(device, non_blocking=True)
             output_batch = parallel_model(
-                input_batch_on_device[0, 0:position_in_batch],
-                input_batch_on_device[1, 0:position_in_batch],
-                input_batch_on_device[2, 0:position_in_batch]
+                input_batch_on_device[0],
+                input_batch_on_device[1],
+                input_batch_on_device[2]
             )
             output_batch.detach_() # requiring grad prevents calling numpy()
             if convert_logits_to_probas:
@@ -753,23 +761,7 @@ class SemanticMatchingModel(nn.Module):
         total_accum.print("Total time to load model:")
         return model
 
-    def evaluate_edge(self, rel_idx, left_idx, right_idx):
-        """
-        Return the value assigned by the (presumably trained) model to the 
-        edge with the given relation, left, and right term indices.
-        """
-        rel_tensor = torch.tensor([rel_idx], dtype=torch.int64, device=self.device)
-        left_tensor = torch.tensor(
-            [left_idx], dtype=torch.int64, device=self.device
-        )
-        right_tensor = torch.tensor(
-            [right_idx], dtype=torch.int64, device=self.device
-        )
-        model_output = self(rel_tensor, left_tensor, right_tensor)
-        value = model_output.item()
-        return value
-
-    def evaluate_conceptnet(self, input_file, cutoff_value=-1, output_filename=None):
+    def evaluate_conceptnet(self, input_file, cutoff_value=-1, output_filename=None, **kwargs):
         """
         Use the SME model to "sanity-check" existing edges in ConceptNet.
         We particularly highlight edges that get a value of -1 or less, which
@@ -782,25 +774,22 @@ class SemanticMatchingModel(nn.Module):
         else:
             out = None
 
-        with open(input_file, "rt", encoding="utf-8") as fp:
-            for line in fp:
-                _assertion, rel, left, right, _rest = line.split("\t", 4)
-                try:
-                    rel_idx = RELATION_INDEX.get_loc(rel)
-                    left_idx = self.index.get_loc(left)
-                    right_idx = self.index.get_loc(right)
-                except KeyError:
-                    continue
+        def edge_iterator():
+            with open(input_file, "rt", encoding="utf-8") as fp:
+                for line in fp:
+                    _assertion, rel, left, right, _rest = line.split("\t", 4)
+                    yield rel, left, right
 
-                value = self.evaluate_edge(rel_idx, left_idx, right_idx)
-                assertion = assertion_uri(rel, left, right)
-                if value < cutoff_value:
-                    print("%4.4f\t%s" % (value, assertion))
-                if out is not None:
-                    print("%4.4f\t%s" % (value, assertion), file=out)
+        for value, edge in self.score_edges(edge_iterator(), **kwargs):
+            assertion = assertion_uri(*edge)
+            if value < cutoff_value:
+                print("%4.4f\t%s" % (value, assertion))
+            if out is not None:
+                print("%4.4f\t%s" % (value, assertion), file=out)
 
     def evaluate_statistics(self, input_filename, output_filename=None,
-                            n_edges=-1, n_perturbations_per_edge=99, random_state=None):
+                            n_edges=-1, n_perturbations_per_edge=99, random_state=None,
+                            **kwargs):
         """
         Read edges from the given input file, compute figures of merit based 
         on the (presumably trained) model's preditions compared to those edges, 
@@ -822,7 +811,8 @@ class SemanticMatchingModel(nn.Module):
         at 10%").  Also, we compute the excess of the score value assigned by 
         the model to each of the orignal edges over the median score of its 
         perturbations, and report the 10th, 50th, and 90th percentiles (over 
-        all the original edges) of this excess score.
+        all the original edges) of this excess score, and the same percentiles 
+        of the ratio of this excess to the original score.
         
         The random state used for sampling (and perturbation) may be specified 
         as the value of the parameter random_state; if unspecified a non-determnistic 
@@ -855,46 +845,82 @@ class SemanticMatchingModel(nn.Module):
             n_edges = len(edges)
 
         print("Compiling statistics.")
+        # To enable batched evaluation of edges by the model, define an
+        # iterator to give to self.score_edges.  The edges returned are
+        # decorated on the right (where score_edges will ignore it) with
+        # an indicator of whether they are original edges or perturbations.
+        def edge_iterator():
+            for i_edge in range(n_edges):
+                # Yield a randomly-chosen edge from the input set.
+                rel_idx, left_idx, right_idx = edge_list[random_state.choice(len(edge_list))]
+                yield rel_idx, left_idx, right_idx, True
+                # Then yield a block of perturbations of it.
+                for i_new_edge in range(n_perturbations_per_edge):
+                    new_term_idx = random_state.choice(len(self.index))
+                    if random_state.choice(2) == 0:
+                        new_edge = (rel_idx, new_term_idx, right_idx)
+                    else:
+                        new_edge = (rel_idx, left_idx, new_term_idx)
+                    if new_edge in edge_set:
+                        continue
+                    yield new_edge + (False,)
+        
         quantiles = []
         precision_at_10_count = 0
         n_totals = []
         excesses_over_median = []
-        for i_edge in range(n_edges):
-            if (i_edge + 1) % 500 == 0:
-                print("Processing edge {} (of {}).".format(i_edge + 1, n_edges))
-            rel_idx, left_idx, right_idx = edge_list[random_state.choice(len(edge_list))]
-            value = self.evaluate_edge(rel_idx, left_idx, right_idx)
-            n_bad_below = 0
-            n_total = 1 # count the original edge
-            new_values = []
-            for i_new_edge in range(n_perturbations_per_edge):
-                new_term_idx = random_state.choice(len(self.index))
-                if random_state.choice(2) == 0:
-                    new_edge = (rel_idx, new_term_idx, right_idx)
-                else:
-                    new_edge = (rel_idx, left_idx, new_term_idx)
-                if new_edge in edge_set:
+        excess_ratios = []
+
+        # We force one extra iteration of the loop over edges, to execute
+        # the code finalizing the statistics for the final original edge,
+        # by handing the loop a final fake edge marked as original.
+        sentinel_edge = (0, 0, 0, True)
+        
+        i_edge = 0
+        for value, edge in itertools.chain(
+                self.score_edges(edge_iterator(), edges_given_as_indices=True, **kwargs),
+                [(0, sentinel_edge)]
+        ):
+            i_edge += 1
+            if i_edge % 5000 == 0:
+                print("Processing edge {} (of about {}).".format(
+                    i_edge, n_edges * n_perturbations_per_edge))
+
+            rel_idx, left_idx, right_idx, is_original_edge = edge
+            if is_original_edge:
+                # This edge is from the input set, not a perturbation.
+                if i_edge > 1:
+                    # Finish processing previous edge from the input.
+                    quantile = float(n_bad_below) / float(n_total)
+                    quantiles.append(quantile)
+                    if quantile > 0.9:
+                        precision_at_10_count += 1
+                    n_totals.append(n_total)
+                    median_new_value = np.median(new_values)
+                    excess_over_median = value - median_new_value
+                    excesses_over_median.append(excess_over_median)
+                    excess_ratios.append(excess_over_median / original_value)
+                # Set up the current edge.
+                original_value = value
+                n_bad_below = 0
+                n_total = 1 # count the new (original) edge
+                new_values = []
+            else:
+                # This is an edge derived by perturbation.
+                if edge in edge_set:
                     continue
                 n_total += 1
-                new_value = self.evaluate_edge(*new_edge)
-                new_values.append(new_value)
-                if new_value < value:
+                new_values.append(value)
+                if value < original_value:
                     n_bad_below += 1
-            quantile = float(n_bad_below) / float(n_total) 
-            quantiles.append(quantile)
-            if quantile >= 0.9:
-                precision_at_10_count += 1
-            n_totals.append(n_total)
-            median_new_value = np.median(new_values)
-            excess_over_median = value - median_new_value
-            excesses_over_median.append(excess_over_median)
-
+        
         median_quantile = np.median(quantiles)
         mean_quantile = np.mean(quantiles)
         precision_at_10 = precision_at_10_count / n_edges
         median_n_totals = np.median(n_totals)
         mean_n_totals = np.mean(n_totals)
         quantiles_of_excess_over_median = np.percentile(excesses_over_median, [10, 50, 90])
+        quantiles_of_excess_ratio = np.percentile(excess_ratios, [10, 50, 90])
 
         print("Number of true edges examined is {}.".format(n_edges))
         print("Number of generated edges per true edge is {}.".format(
@@ -912,6 +938,12 @@ class SemanticMatchingModel(nn.Module):
             quantiles_of_excess_over_median[1]))
         print("90th percentile of excess of known positive edge score over median perturbed edge score is {}".format(
             quantiles_of_excess_over_median[2]))
+        print("10th percentile of ratio of excess to known positive score is {}.".format(
+            quantiles_of_excess_ratio[0]))
+        print("50th percentile of ratio of excess to known positive score is {}.".format(
+            quantiles_of_excess_ratio[1]))
+        print("90th percentile of ratio of excess to known positive score is {}.".format(
+            quantiles_of_excess_ratio[2]))
 
         if output_filename is not None:
             import json
@@ -923,7 +955,10 @@ class SemanticMatchingModel(nn.Module):
                                precision_at_10=precision_at_10,
                                q10_of_excess=quantiles_of_excess_over_median[0],
                                q50_of_excess=quantiles_of_excess_over_median[1],
-                               q90_of_excess=quantiles_of_excess_over_median[2]),
+                               q90_of_excess=quantiles_of_excess_over_median[2],
+                               q10_of_excess_ratio=quantiles_of_excess_ratio[0],
+                               q50_of_excess_ratio=quantiles_of_excess_ratio[1],
+                               q90_of_excess_ratio=quantiles_of_excess_ratio[2]),
                           fp)
 
     def export(self, dirname):
