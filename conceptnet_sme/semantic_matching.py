@@ -10,27 +10,28 @@ USE_MULTIPLE_GPUS = True
 # batches over multiple CPU cores (by spawning that number of worker processes;
 # 10 is a reasonable choice if you have multiple CPUs).
 
-NUM_BATCH_WORKERS = 10
+NUM_BATCH_WORKERS = 0
 if NUM_BATCH_WORKERS > 0:
     try:
         torch.multiprocessing.set_start_method("spawn")
     except RuntimeError:
         pass
 
-import torch.autograd as autograd
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.sampler import Sampler
 from conceptnet5.vectors.formats import save_hdf, save_npy
+from conceptnet5.formats.msgpack_stream import MsgpackStreamWriter
 import numpy as np
 import pandas as pd
-import copy
 import random
 import pathlib
 import os
 import contextlib
+import datetime
 import time
+import itertools
 
 from conceptnet_sme.relations import (
     COMMON_RELATIONS,
@@ -46,10 +47,15 @@ from conceptnet5.vectors.transforms import l2_normalize_rows
 
 RELATION_INDEX = pd.Index(COMMON_RELATIONS)
 N_RELS = len(RELATION_INDEX)
-INITIAL_VECS_FILENAME = get_data_filename("vectors/numberbatch-biased.h5")
+INITIAL_VECS_FILENAME = get_data_filename("vectors/numberbatch.h5")
+#INITIAL_VECS_FILENAME = get_data_filename("vectors/mini.h5")
 EDGES_FILENAME = get_data_filename("collated/sorted/edges-shuf.csv")
+VALIDATION_FILENAME = get_data_filename("collated/sorted/edges-shuf-validation.csv")
 MODEL_FILENAME = get_data_filename("sme/sme.model")
+LOG_FILENAME = get_data_filename("sme/sme.log")
 NEG_SAMPLES = 5
+ADVERSARIAL_SAMPLES = 3
+PREDICT_SHARDS = 100
 LANGUAGES_TO_USE = [
     "en",
     "fr",
@@ -71,8 +77,30 @@ LANGUAGES_TO_USE = [
     "mul",
 ]
 BATCH_SIZE = 160
+N_VALIDATION_BATCHES = 50
 
 random.seed(0)
+
+
+class _MessageWriter:
+    def __init__(self, filename=LOG_FILENAME):
+        self.file = open(filename, 'at', encoding='utf-8')
+        timestamp = datetime.datetime.utcnow().isoformat()
+        print("Logging started at {}".format(timestamp), file=self.file)
+
+    def __del__(self):
+        self.file.close()
+
+    def write(self, msg):
+        print(msg, file=self.file)
+
+_message_writer = None
+
+def log_message(msg):
+    global _message_writer
+    print(msg)
+    if _message_writer is not None:
+        _message_writer.write(msg)
 
 
 def coin_flip():
@@ -113,7 +141,7 @@ ENTAILED_INDICES, UNRELATED_INDICES = _make_rel_chart()
 @contextlib.contextmanager
 def stopwatch(consumer):
     """
-    After executing the managed block of code, call the provided consumer with 
+    After executing the managed block of code, call the provided consumer with
     two arguments, the start and end times of the execution of the block.
     """
     start_time = time.perf_counter()
@@ -126,8 +154,8 @@ def stopwatch(consumer):
 
 class TimeAccumulator:
     """
-    A simple consumer for use with stopwatches, that accumulates the total 
-    elapsed time over multiple calls, and has a convenience method for printing 
+    A simple consumer for use with stopwatches, that accumulates the total
+    elapsed time over multiple calls, and has a convenience method for printing
     the total time (and optionally resetting it).
     """
 
@@ -140,7 +168,7 @@ class TimeAccumulator:
         return
 
     def print(self, caption, accumulated_time=None):
-        print("{} {} sec.".format(caption, self.accumulated_time))
+        log_message("{} {} sec.".format(caption, self.accumulated_time))
         if accumulated_time is not None:
             self.accumulated_time = accumulated_time
         return
@@ -148,29 +176,32 @@ class TimeAccumulator:
 
 class EdgeDataset(Dataset):
     """
-    Wrapper class (around an iteration over ConceptNet edges) that enables us 
+    Wrapper class (around an iteration over ConceptNet edges) that enables us
     to use a torch DataLoader to parallelize generation of training batches.
     """
 
-    def __init__(self, filename, index):
+    def __init__(self, filename, model):
         """
-        Construct an edge dataset from a filename (of a tab-separated 
-        ConceptNet edge file, which should be in random order), and a (pandas) 
-        index mapping (row) numbers to terms of the ConceptNet vocabulary. 
+        Construct an edge dataset from a filename (of a tab-separated
+        ConceptNet edge file, which should be in random order), and a (pandas)
+        index mapping (row) numbers to terms of the ConceptNet vocabulary.
         """
         super().__init__()
         self.filename = filename
-        self.index = index
+        self.model = model
+        self.index = model.index
         self.n_terms = len(self.index)
+        self.edge_set = set()
         # Cache the edges in CPU memory as torch LongTensors,
         # skipping edges we don't intend to process.
         rel_indices = []
         left_indices = []
         right_indices = []
         weights = []
+
         for count, (rel, left, right, weight) in enumerate(self.iter_edges_once()):
-            if count % 500000 == 0:
-                print("Read {} edges.".format(count))
+            if count % 500000 == 0 and count > 0:
+                log_message("Read {} edges.".format(count))
             if rel not in COMMON_RELATIONS:
                 continue
             if not ENTAILED_INDICES[rel]:
@@ -186,9 +217,19 @@ class EdgeDataset(Dataset):
             rel_indices.append(rel_idx)
             left_indices.append(left_idx)
             right_indices.append(right_idx)
+
+            self.edge_set.add((rel_idx, left_idx, right_idx))
+            entailed_rels = ENTAILED_INDICES[RELATION_INDEX[rel_idx]]
+            for entailed in entailed_rels:
+                self.edge_set.add((entailed, left_idx, right_idx))
+            if rel in SYMMETRIC_RELATIONS:
+                self.edge_set.add((rel_idx, right_idx, left_idx))
+                for entailed in entailed_rels:
+                    self.edge_set.add((entailed, right_idx, left_idx))
+
             weights.append(weight)
         if len(rel_indices) < 1:
-            print("No edges survived filtering; fitting is impossible!")
+            log_message("No edges survived filtering; fitting is impossible!")
             raise ValueError
         self.rel_indices = torch.LongTensor(rel_indices)
         self.left_indices = torch.LongTensor(left_indices)
@@ -209,15 +250,17 @@ class EdgeDataset(Dataset):
 
     def __getitem__(self, i_edge):
         """
-        Produce a positive example and weight and a batch of (of size 
-        NEG_SAMPLES) of negative examples, derived from the edge at the 
-        given index.  The return values are three torch tensors containing 
-        the positive example, the negative examples, and the weights.
+        Produce a positive example, followed by a number of generated examples that
+        are presumed to be negative (but might accidentally be positive). Return these
+        examples collated into tensors.
         """
         rel_idx = self.rel_indices[i_edge]
+        orig_rel_idx = rel_idx
         left_idx = self.left_indices[i_edge]
         right_idx = self.right_indices[i_edge]
         weight = self.edge_weights[i_edge]
+
+        examples = []
 
         rel = RELATION_INDEX[rel_idx]
 
@@ -230,14 +273,9 @@ class EdgeDataset(Dataset):
             rel_idx = random.choice(ENTAILED_INDICES[rel])
             rel = COMMON_RELATIONS[rel_idx]
 
-        pos_rels = [rel_idx]
-        pos_left = [left_idx]
-        pos_right = [right_idx]
-        weights = [weight]
+        examples.append((int(rel_idx), int(left_idx), int(right_idx), weight))
 
-        neg_rels = []
-        neg_left = []
-        neg_right = []
+        n_neg = NEG_SAMPLES + ADVERSARIAL_SAMPLES * 2
 
         for iter in range(NEG_SAMPLES):
             corrupt_rel_idx = rel_idx
@@ -258,44 +296,60 @@ class EdgeDataset(Dataset):
                 while corrupt_right_idx == right_idx:
                     corrupt_right_idx = random.randrange(self.n_terms)
 
-            neg_rels.append(corrupt_rel_idx)
-            neg_left.append(corrupt_left_idx)
-            neg_right.append(corrupt_right_idx)
+            examples.append((int(corrupt_rel_idx), int(corrupt_left_idx), int(corrupt_right_idx), weight / n_neg))
 
-        pos_data = dict(
-            rel=torch.LongTensor(pos_rels),
-            left=torch.LongTensor(pos_left),
-            right=torch.LongTensor(pos_right),
+        best_terms_right, best_values_right = self.model.predict_terms(
+            torch.LongTensor([rel_idx]),
+            torch.LongTensor([left_idx]),
+            PREDICT_SHARDS, random.randrange(PREDICT_SHARDS), forward=True, topk=ADVERSARIAL_SAMPLES
         )
-        neg_data = dict(
-            rel=torch.LongTensor(neg_rels),
-            left=torch.LongTensor(neg_left),
-            right=torch.LongTensor(neg_right),
+        best_terms_left, best_values_left = self.model.predict_terms(
+            torch.LongTensor([rel_idx]),
+            torch.LongTensor([right_idx]),
+            PREDICT_SHARDS, random.randrange(PREDICT_SHARDS), forward=False, topk=ADVERSARIAL_SAMPLES
         )
-        weights = torch.FloatTensor(weights)
-        return dict(positive_data=pos_data, negative_data=neg_data, weights=weights)
+
+        for row in best_terms_left:
+            for predicted_left in row:
+                examples.append((int(orig_rel_idx), int(predicted_left), int(right_idx), weight / n_neg))
+        for row in best_terms_right:
+            for predicted_right in row:
+                examples.append((int(orig_rel_idx), int(left_idx), int(predicted_right), weight / n_neg))
+
+        targets = [example[:3] in self.edge_set for example in examples]
+        assert examples[0][:3] in self.edge_set
+        rels, lefts, rights, weights = zip(*examples)
+        data = dict(
+            rels=torch.LongTensor(rels),
+            lefts=torch.LongTensor(lefts),
+            rights=torch.LongTensor(rights),
+            weights=torch.FloatTensor(weights),
+            targets=torch.FloatTensor(targets)
+        )
+
+        lastk = ADVERSARIAL_SAMPLES * 2
+        eval_batch = rels[-lastk:], lefts[-lastk:], rights[-lastk:], weights[-lastk:], targets[-lastk:]
+        if random.random() < 0.01:
+            self.model.show_debug(eval_batch)
+        return data
 
     def collate_batch(self, batch):
         """
-        Collates batches (as returned by a DataLoader that batches 
-        the outputs of calls to __getitem__) into tensors (as required 
+        Collates batches (as returned by a DataLoader that batches
+        the outputs of calls to __getitem__) into tensors (as required
         by the train method of SemanticMatchingModel).
         """
-        pos_rels = torch.cat(list(x["positive_data"]["rel"] for x in batch))
-        pos_left = torch.cat(list(x["positive_data"]["left"] for x in batch))
-        pos_right = torch.cat(list(x["positive_data"]["right"] for x in batch))
-        neg_rels = torch.cat(list(x["negative_data"]["rel"] for x in batch))
-        neg_left = torch.cat(list(x["negative_data"]["left"] for x in batch))
-        neg_right = torch.cat(list(x["negative_data"]["right"] for x in batch))
-        weights = torch.cat(list(x["weights"] for x in batch))
-        pos_data = (pos_rels, pos_left, pos_right)
-        neg_data = (neg_rels, neg_left, neg_right)
-        return pos_data, neg_data, weights
+        rels = torch.cat([x["rels"] for x in batch])
+        lefts = torch.cat([x["lefts"] for x in batch])
+        rights = torch.cat([x["rights"] for x in batch])
+        weights = torch.cat([x["weights"] for x in batch])
+        targets = torch.cat([x["targets"] for x in batch])
+        return (rels, lefts, rights, weights, targets)
 
 
 class CyclingSampler(Sampler):
     """
-    Like a sequential sampler, but these samplers cycle repeatedly over the 
+    Like a sequential sampler, but these samplers cycle repeatedly over the
     data source, and so have infinite length.
     """
 
@@ -314,9 +368,25 @@ class CyclingSampler(Sampler):
 
     def __len__(self):
         """
-        Length makes no sense for a cycling sampler; it is effectively infiinte.
+        Length makes no sense for a cycling sampler; it is effectively infinite.
         """
         raise NotImplementedError
+
+class SubsetSequentialSampler(Sampler):
+    """
+    Like a SubsetRandomSampler, but always returns the elements of the 
+    specified subset in order.
+    """
+
+    def __init__(self, length):
+        self.length = length
+        self.indices = range(length)
+
+    def __iter__(self):
+        return iter(self.indices)
+
+    def __len__(self):
+        return self.length
 
 
 class SemanticMatchingModel(nn.Module):
@@ -324,15 +394,13 @@ class SemanticMatchingModel(nn.Module):
     The PyTorch model for semantic matching energy over ConceptNet.
     """
 
-    def __init__(self, frame, use_cuda=True, term_dim=300, relation_dim=10):
+    def __init__(self, frame, use_cuda=True, relation_dim=10):
         """
         Parameters:
 
         `frame`: a pandas DataFrame of pre-trained word embeddings over the
         vocabulary of ConceptNet. `conceptnet5.vectors.formats.load_hdf`
         can load these.
-
-        `term_dim`: the number of dimensions in the term embedding.
 
         `use_cuda`: whether to use GPU-accelerated PyTorch objects.
 
@@ -343,11 +411,19 @@ class SemanticMatchingModel(nn.Module):
         super().__init__()
 
         # Initialize term embeddings, including the index that converts terms
-        # from strings to row numbers
-        print("Intializing term embeddings.")
+        # from strings to row numbers and the index converting relations to
+        # row numbers in the relation vector embedding.
+        log_message("Intializing term embeddings.")
         self.index = frame.index
-        self.term_vecs = nn.Embedding(len(self.index), term_dim, sparse=True)
+        n_frame_terms, term_dim = frame.values.shape
+        self.term_vecs = nn.Embedding(n_frame_terms, term_dim, sparse=True)
         self.term_vecs.weight.data.copy_(torch.from_numpy(frame.values))
+
+        # Create a mapping from languages to index numbers
+        self.index_by_language = {}
+        for i, term in enumerate(frame.index):
+            lang = get_uri_language(term)
+            self.index_by_language.setdefault(lang, []).append(i)
 
         # The assoc_tensor is a (k_2 x k_1 x k_1) tensor that represents
         # interactions between the relations and the terms. k_1 is the
@@ -358,12 +434,12 @@ class SemanticMatchingModel(nn.Module):
         # PyTorch convention is that inputs come before outputs, but the
         # resulting tensor is (k_2 x k_1 x k_1) because the math convention
         # is that outputs are on the left.
-        print("Initializing association tensor and relation embedding.")
+        log_message("Initializing association tensor and relation embedding.")
         self.assoc_tensor = nn.Bilinear(term_dim, term_dim, relation_dim, bias=True)
         self.rel_vecs = nn.Embedding(N_RELS, relation_dim, sparse=True)
 
         # Using CUDA to run on the GPU requires different data types
-        print("Setting model device (cpu/gpu).")
+        log_message("Setting model device (cpu/gpu).")
         if use_cuda and torch.cuda.is_available():
             self.device = torch.device("cuda:0")
         else:
@@ -371,7 +447,7 @@ class SemanticMatchingModel(nn.Module):
 
         # Create (and register) the identity tensor used to reset the synonym
         # relation.  (Register it so it will be included in the state dict.)
-        print("Initializing identity slice.")
+        log_message("Initializing identity slice.")
         self.register_buffer(
             "identity_slice",
             torch.tensor(np.eye(term_dim), dtype=torch.float32, device=self.device),
@@ -382,16 +458,16 @@ class SemanticMatchingModel(nn.Module):
         # These are used to convert the tensor products linearly into logits.
         # The initial values of these are set to numbers that appeared
         # reasonable based on a previous run.
-        print("Initializing logit scale factors.")
+        log_message("Initializing logit scale factors.")
         self.truth_multiplier = nn.Parameter(
             torch.tensor(5.0, dtype=torch.float32)
         )
         self.truth_offset = nn.Parameter(
             torch.tensor(-3.0, dtype=torch.float32)
         )
-        
+
         # Make sure everything is on the right device.
-        print("Moving model to selected device (cpu/gpu).")
+        log_message("Moving model to selected device (cpu/gpu).")
         self.to(self.device)
 
     def reset_synonym_relation(self):
@@ -420,44 +496,232 @@ class SemanticMatchingModel(nn.Module):
         A truth judgment is a logit, and can be converted to a probability
         using the sigmoid function.
         """
-        # Get relation vectors for the whole batch, with shape (b, i)
-        rels_b_i = self.rel_vecs(rels)
+        # Get relation vectors for the whole batch, with shape (b, k)
+        rels_b_k = self.rel_vecs(rels)
         # Get left term vectors for the whole batch, with shape (b, L)
         terms_b_L = self.term_vecs(terms_L)
         # Get right term vectors for the whole batch, with shape (b, R)
         terms_b_R = self.term_vecs(terms_R)
 
         # Get the interaction of the terms in relation-embedding space, with
-        # shape (b, i).
-        inter_b_i = self.assoc_tensor(terms_b_L, terms_b_R)
+        # shape (b, k).
+        inter_b_k = self.assoc_tensor(terms_b_L, terms_b_R)
 
-        # Multiply our (b * i) term elementwise by rels_b_i. This indicates
+        # Multiply our (b * k) term elementwise by rels_b_k. This indicates
         # how well the interaction between term L and term R matches each
         # component of the relation vector.
-        relmatch_b_i = inter_b_i * rels_b_i
+        relmatch_b_k = inter_b_k * rels_b_k
 
         # Add up the components for each item in the batch
-        energy_b = torch.sum(relmatch_b_i, 1)
+        energy_b = torch.sum(relmatch_b_k, 1)
 
         return energy_b * self.truth_multiplier + self.truth_offset
 
-    def show_debug(self, batch, energy, positive):
+    def score_edges(
+            self,
+            edges,
+            batch_size=32,
+            convert_logits_to_probas=False,
+            device=None,
+            use_multiple_gpus=False,
+            edges_given_as_indices=False
+    ):
+        """
+        Given a SemanticMatchingModel and an iteratable of edges (in the form of 
+        tuples starting with a relation, a left endpoint, and a right endpoint, 
+        or, if the argument edges_given_as_indices equals True, as triples of 
+        relation, left- and right-endpoint indices), return an iterator 
+        yielding the same tuples paired with the model's scores to the edge, 
+        for all of the given edges whose endpoints are present in the model's 
+        term index and whose relation is in the model's relation index.
+        
+        Scores are returned in units of logits, unless conversion to probabilities 
+        is requested by setting the optional paramenter convert_logits_to_probas 
+        to True.  If a device is specified (with the device parameter) then the 
+        model will be moved to that device before scoring takes place; otherwise 
+        the model will be moved to the device given by its device attribute (if not 
+        already there).  After that, if use_multiple_gpus (default False) is 
+        set to True, the model will be parallelized across all available gpu's 
+        (using DataParalleizedModule).  Edges are scored in batches, with a default 
+        size of 32 (which may be changed by setting the batch_size parameter).
+        """
+        # If a device is specified, move the model there before applying it.
+        # Regardless, input for the model will be constructed in batches on the
+        # cpu then moved to the device where the model is, and outputs will be
+        # moved from there to the cpu.
+        if device is None:
+            device = self.device
+        self.to(device)
+
+        # Put the model on all available gpu's, if so requested.
+        parallel_model = DataParallelizedModule(
+            self,
+            device,
+            copy_fn=_model_copier,
+            parallelize=use_multiple_gpus)
+
+        # Put the model(s) in evaluation mode.
+        for model_copy in parallel_model.children:
+            model_copy.eval()
+
+        # We'll batch the edges together before handing them to the model for
+        # evaluation, for efficiency's sake.  As torch tensors are stored row-major,
+        # and the model expects three tensors as input, we make batches of size
+        # 3 x b, then split them by rows to feed them to the model.
+        input_batch = torch.empty(
+            [3, batch_size], dtype=torch.int64, requires_grad=False)
+        input_batch.pin_memory() # speed up any transfer to gpu
+        input_batch_on_device = torch.empty_like(input_batch, device=device)
+        input_batch_edges = []
+
+        position_in_batch = 0
+        for edge in edges:
+            # Translate the string fields of the edge to indices the model knows,
+            # if necessary.
+            if edges_given_as_indices:
+                rel_idx, left_idx, right_idx = edge[:3]
+            else:
+                rel, left, right = edge[:3]
+                try:
+                    rel_idx = RELATION_INDEX.get_loc(rel)
+                    left_idx = self.index.get_loc(left)
+                    right_idx = self.index.get_loc(right)
+                except KeyError:
+                    continue # the model can't handle this edge
+
+            # Insert the new edge's data into the growing batch.
+            input_batch[0, position_in_batch] = rel_idx
+            input_batch[1, position_in_batch] = left_idx
+            input_batch[2, position_in_batch] = right_idx
+            input_batch_edges.append(edge)
+
+            # Keep track of where to insert, and when a batch is full.
+            position_in_batch += 1
+            if position_in_batch < batch_size:
+                continue
+
+            # Handle a full batch buffer.
+
+            input_batch_on_device = input_batch.cuda(device, non_blocking=True)
+            output_batch = parallel_model(
+                input_batch_on_device[0], input_batch_on_device[1], input_batch_on_device[2]
+            )
+            output_batch.detach_() # requiring grad prevents calling numpy()
+            if convert_logits_to_probas:
+                output_batch.sigmoid_()
+            output_batch = output_batch.cpu().numpy()
+            for i_edge in range(batch_size):
+                yield output_batch[i_edge], input_batch_edges[i_edge]
+            position_in_batch = 0 # setup next batch
+            input_batch_edges = []
+
+        # Handle any final (shorter than normal) batch.
+        # Note that we evaluate a full-size batch in case the actual size
+        # is not divisible by the number of gpu's in use.  But we only
+        # return the legitimate data.
+        
+        if position_in_batch > 0:
+            input_batch_on_device = input_batch.cuda(device, non_blocking=True)
+            output_batch = parallel_model(
+                input_batch_on_device[0],
+                input_batch_on_device[1],
+                input_batch_on_device[2]
+            )
+            output_batch.detach_() # requiring grad prevents calling numpy()
+            if convert_logits_to_probas:
+                output_batch.sigmoid_()
+            output_batch = output_batch.cpu().numpy()
+            for i_edge in range(position_in_batch):
+                yield output_batch[i_edge], input_batch_edges[i_edge]
+
+    def make_edge_score_file(self, input_filename, output_filename, **kwargs):
+        """
+        Read edges from the given input file, score them via score_edges, and 
+        write 4-tuples (rel, left, right, score) as a msgpack stream to the 
+        given output file.  Any additional kwargs given are passed on to 
+        score_edges.
+        """
+        def edge_iterator(input_filename):
+            with open(input_filename, "rt", encoding="utf-8") as fp:
+                for line in fp:
+                    fields = line.split('\t')
+                    # fields[0] is the assertion
+                    rel = fields[1]
+                    left = uri_prefix(fields[2])
+                    right = uri_prefix(fields[3])
+                    yield rel, left, right
+        writer = MsgpackStreamWriter(output_filename)
+        for score, (rel, left, right) in self.score_edges(edge_iterator(input_filename), **kwargs):
+            writer.write((rel, left, right, float(score)))
+    
+    def predict_wrapper(self, relname, termname, forward=True, topk=10):
+        rel_idx = RELATION_INDEX.get_loc(relname)
+        term_idx = self.index.get_loc(termname)
+        best_terms, best_values = self.predict_terms(
+            torch.LongTensor([rel_idx]),
+            torch.LongTensor([term_idx]),
+            1, 0, forward=forward, topk=topk
+        )
+
+        best_terms = best_terms[0].cpu().numpy()
+        best_values = best_values[0].cpu().numpy()
+
+        best_term_names = self.index[best_terms]
+        return pd.DataFrame(best_values, index=best_term_names)
+
+    def predict_terms(self, rels, terms, nshards=1, offset=0, forward=True, topk=1):
+        with torch.no_grad():
+            # Indices here use different letters to represent different dimensions, like
+            # in Einstein notation.
+            #
+            # b: items in the batch
+            # k: relation vectors
+            # L and R: term vectors, distinguishing left terms from right terms
+            # T: one of L or R, whichever one we have as input
+            # m: terms in the subset of vocabulary we're using
+
+            # Get a subset of terms that we'll try to predict. This has dimensions (m x R),
+            # as it maps the vocabulary to term vectors.
+            lang = get_uri_language(self.index[terms[0]])
+            lang_indices = self.index_by_language[lang]
+            candidate_indices = torch.LongTensor([
+                idx for idx in lang_indices[offset::nshards]
+                if idx != int(terms[0])
+            ])
+
+            candidate_terms_m_T = self.term_vecs.weight[candidate_indices]
+
+            rels_b_k = self.rel_vecs(rels.to(self.device))
+            assoc_k_L_R = self.assoc_tensor.weight
+            terms_b_T = self.term_vecs(terms.to(self.device))
+
+            # And now that we've got all these indices in Einstein notation, we can use
+            # Einstein notation to describe exactly the operation that multiplies them,
+            # giving us a (b x m) batch of term predictions.
+            if forward:
+                predictions_b_m = torch.einsum('bk,bl,klr,mr->bm', (rels_b_k, terms_b_T, assoc_k_L_R, candidate_terms_m_T))
+            else:
+                predictions_b_m = torch.einsum('bk,br,klr,ml->bm', (rels_b_k, terms_b_T, assoc_k_L_R, candidate_terms_m_T))
+
+            best_values, best_indices = torch.topk(predictions_b_m, topk, dim=1)
+            best_terms_reindexed = torch.take(candidate_indices, best_indices.cpu())
+            return best_terms_reindexed, best_values
+
+    def show_debug(self, batch):
         """
         On certain iterations, we show the training examples and what the model
         believed about them.
         """
-        truth_values = energy
-        rel_indices, left_indices, right_indices = batch
-        if positive:
-            print("POSITIVE")
-        else:
-            print("\nNEGATIVE")
-        for i in range(len(energy)):
-            rel = RELATION_INDEX[int(rel_indices.data[i])]
-            left = self.index[int(left_indices.data[i])]
-            right = self.index[int(right_indices.data[i])]
-            value = truth_values.data[i]
-            print("[%4.4f] %s %s %s" % (value, rel, left, right))
+        rel_indices, left_indices, right_indices, weights, targets = batch
+        index_order = np.arange(len(weights))
+
+        for i in index_order:
+            rel = RELATION_INDEX[int(rel_indices[i])]
+            left = self.index[int(left_indices[i])]
+            right = self.index[int(right_indices[i])]
+            if get_uri_language(left) == 'en':
+                target = int(targets[i])
+                print(f'{target}  {rel:<20} {left:<20} {right:<20}')
 
     @staticmethod
     def load_initial_frame():
@@ -466,11 +730,11 @@ class SemanticMatchingModel(nn.Module):
         """
         total_accum = TimeAccumulator()
         incremental_accum = TimeAccumulator()
-        print("Loading frame from file {}.".format(INITIAL_VECS_FILENAME))
+        log_message("Loading frame from file {}.".format(INITIAL_VECS_FILENAME))
         with stopwatch(total_accum), stopwatch(incremental_accum):
             frame = load_hdf(INITIAL_VECS_FILENAME)
         incremental_accum.print("Reading frame from file took", accumulated_time=0.0)
-        print("Filtering terms in frame by language.")
+        log_message("Filtering terms in frame by language.")
         with stopwatch(total_accum), stopwatch(incremental_accum):
             labels = [
                 label
@@ -479,7 +743,7 @@ class SemanticMatchingModel(nn.Module):
             ]
             frame = frame.loc[labels]
         incremental_accum.print("Filtering took", accumulated_time=0.0)
-        print("Casting frame to float32.")
+        log_message("Casting frame to float32.")
         with stopwatch(total_accum), stopwatch(incremental_accum):
             frame = frame.astype(np.float32)
         incremental_accum.print("Casting took", accumulated_time=0.0)
@@ -487,20 +751,21 @@ class SemanticMatchingModel(nn.Module):
         return frame
 
     @staticmethod
-    def load_model(filename):
+    def load_model(filename, use_cuda=True):
         """
-        Load the SME model from a file.
+        Load the SME model from a file.  If use_cuda is True (the default), the 
+        model will be placed on a gpu, otherwise on the cpu.
         """
         total_accum = TimeAccumulator()
         incremental_accum = TimeAccumulator()
-        print("Loading model from file {}.".format(filename))
+        log_message("Loading model from file {}.".format(filename))
         with stopwatch(total_accum):
             frame = SemanticMatchingModel.load_initial_frame()
-        print("Constructing model from frame.")
+        log_message("Constructing model from frame.")
         with stopwatch(total_accum), stopwatch(incremental_accum):
-            model = SemanticMatchingModel(frame)
+            model = SemanticMatchingModel(frame, use_cuda=use_cuda)
         incremental_accum.print("Constructing model took", accumulated_time=0.0)
-        print("Restoring model state from file.")
+        log_message("Restoring model state from file.")
         with stopwatch(total_accum), stopwatch(incremental_accum):
             # We have adopted the convention that models are moved to the
             # cpu before saving their state (as else loading would need
@@ -513,7 +778,7 @@ class SemanticMatchingModel(nn.Module):
         total_accum.print("Total time to load model:")
         return model
 
-    def evaluate_conceptnet(self, dataset, cutoff_value=-1, output_filename=None):
+    def evaluate_conceptnet(self, input_file, cutoff_value=-1, output_filename=None, **kwargs):
         """
         Use the SME model to "sanity-check" existing edges in ConceptNet.
         We particularly highlight edges that get a value of -1 or less, which
@@ -525,30 +790,193 @@ class SemanticMatchingModel(nn.Module):
             out = open(output_filename, "w", encoding="utf-8")
         else:
             out = None
-        for rel, left, right, weight in dataset.iter_edges_once():
-            try:
-                rel_idx = RELATION_INDEX.get_loc(rel)
-                left_idx = self.index.get_loc(left)
-                right_idx = self.index.get_loc(right)
-            except KeyError:
-                continue
 
-            rel_tensor = torch.tensor([rel_idx], dtype=torch.int64, device=self.device)
-            left_tensor = torch.tensor(
-                [left_idx], dtype=torch.int64, device=self.device
-            )
-            right_tensor = torch.tensor(
-                [right_idx], dtype=torch.int64, device=self.device
-            )
+        def edge_iterator():
+            with open(input_file, "rt", encoding="utf-8") as fp:
+                for line in fp:
+                    _assertion, rel, left, right, _rest = line.split("\t", 4)
+                    yield rel, left, right
 
-            model_output = self(rel_tensor, left_tensor, right_tensor)
-
-            value = model_output.item()
-            assertion = assertion_uri(rel, left, right)
+        for value, edge in self.score_edges(edge_iterator(), **kwargs):
+            assertion = assertion_uri(*edge)
             if value < cutoff_value:
                 print("%4.4f\t%s" % (value, assertion))
             if out is not None:
                 print("%4.4f\t%s" % (value, assertion), file=out)
+
+    def evaluate_statistics(self, input_filename, output_filename=None,
+                            n_edges=-1, n_perturbations_per_edge=99, random_state=None,
+                            **kwargs):
+        """
+        Read edges from the given input file, compute figures of merit based 
+        on the (presumably trained) model's preditions compared to those edges, 
+        or to a sample of them, print a summary of the results to stdout, and, 
+        if an output filename is given, to that file (in json format).  
+        
+        The number of edges in the sample to use is given by the parameter 
+        n_edges (default -1, meaning use all the edges, i.e. do not sample).
+        
+        For each edge in the sample, a set (of size n_perturbations_per_edge, 
+        default 99) of perturbations of that edge is generated by randomly 
+        altering either the left or right term (chosen with probability 1/2) 
+        to another term from the model's index of terms (chosen uniformly at 
+        random).  The quantile of the original edge's value as assigned by the 
+        model among all the values assigned to perturbations not in the input 
+        file is computed.  The statistics reported are the median and mean, 
+        over all edges of the sample, of this quantile, and the fraction of 
+        edges of the sample for which the quantile is at least 90% ("precision 
+        at 10%").  Also, we compute the excess of the score value assigned by 
+        the model to each of the orignal edges over the median score of its 
+        perturbations, and report the 10th, 50th, and 90th percentiles (over 
+        all the original edges) of this excess score, and the same percentiles 
+        of the ratio of this excess to the original score.
+        
+        The random state used for sampling (and perturbation) may be specified 
+        as the value of the parameter random_state; if unspecified a non-determnistic 
+        seed will be used.
+        """
+        self.eval()
+        if random_state is None:
+            random_state = np.random.RandomState()
+        elif isinstance(random_state, int):
+            random_state = np.random.RandomState(random_state)
+
+        print("Reading edge file.")
+        edge_set = set()
+        edge_list = []
+        with open(input_filename, 'rt', encoding='utf-8') as fp:
+            if (len(edge_list) + 1) % 500000 == 0:
+                print("Reading edge {}".format(len(edge_list) + 1))
+            for line in fp:
+                _assertion, rel, left, right, _rest = line.split("\t", 4)
+                try:
+                    rel_idx = RELATION_INDEX.get_loc(rel)
+                    left_idx = self.index.get_loc(left)
+                    right_idx = self.index.get_loc(right)
+                except KeyError:
+                    continue
+                edge_set.add((rel_idx, left_idx, right_idx))
+                edge_list.append((rel_idx, left_idx, right_idx))
+
+        if not 0 <= n_edges <= len(edge_set):
+            n_edges = len(edges)
+
+        print("Compiling statistics.")
+        # To enable batched evaluation of edges by the model, define an
+        # iterator to give to self.score_edges.  The edges returned are
+        # decorated on the right (where score_edges will ignore it) with
+        # an indicator of whether they are original edges or perturbations.
+        def edge_iterator():
+            for i_edge in range(n_edges):
+                # Yield a randomly-chosen edge from the input set.
+                rel_idx, left_idx, right_idx = edge_list[random_state.choice(len(edge_list))]
+                yield rel_idx, left_idx, right_idx, True
+                # Then yield a block of perturbations of it.
+                for i_new_edge in range(n_perturbations_per_edge):
+                    new_term_idx = random_state.choice(len(self.index))
+                    if random_state.choice(2) == 0:
+                        new_edge = (rel_idx, new_term_idx, right_idx)
+                    else:
+                        new_edge = (rel_idx, left_idx, new_term_idx)
+                    if new_edge in edge_set:
+                        continue
+                    yield new_edge + (False,)
+        
+        quantiles = []
+        precision_at_10_count = 0
+        n_totals = []
+        excesses_over_median = []
+        excess_ratios = []
+
+        # We force one extra iteration of the loop over edges, to execute
+        # the code finalizing the statistics for the final original edge,
+        # by handing the loop a final fake edge marked as original.
+        sentinel_edge = (0, 0, 0, True)
+        
+        i_edge = 0
+        for value, edge in itertools.chain(
+                self.score_edges(edge_iterator(), edges_given_as_indices=True, **kwargs),
+                [(0, sentinel_edge)]
+        ):
+            i_edge += 1
+            if i_edge % 5000 == 0:
+                print("Processing edge {} (of about {}).".format(
+                    i_edge, n_edges * n_perturbations_per_edge))
+
+            rel_idx, left_idx, right_idx, is_original_edge = edge
+            if is_original_edge:
+                # This edge is from the input set, not a perturbation.
+                if i_edge > 1:
+                    # Finish processing previous edge from the input.
+                    quantile = float(n_bad_below) / float(n_total)
+                    quantiles.append(quantile)
+                    if quantile > 0.9:
+                        precision_at_10_count += 1
+                    n_totals.append(n_total)
+                    median_new_value = np.median(new_values)
+                    excess_over_median = value - median_new_value
+                    excesses_over_median.append(excess_over_median)
+                    excess_ratios.append(excess_over_median / original_value)
+                # Set up the current edge.
+                original_value = value
+                n_bad_below = 0
+                n_total = 1 # count the new (original) edge
+                new_values = []
+            else:
+                # This is an edge derived by perturbation.
+                if edge in edge_set:
+                    continue
+                n_total += 1
+                new_values.append(value)
+                if value < original_value:
+                    n_bad_below += 1
+        
+        median_quantile = np.median(quantiles)
+        mean_quantile = np.mean(quantiles)
+        precision_at_10 = precision_at_10_count / n_edges
+        median_n_totals = np.median(n_totals)
+        mean_n_totals = np.mean(n_totals)
+        quantiles_of_excess_over_median = np.percentile(excesses_over_median, [10, 50, 90])
+        quantiles_of_excess_ratio = np.percentile(excess_ratios, [10, 50, 90])
+
+        print("Number of true edges examined is {}.".format(n_edges))
+        print("Number of generated edges per true edge is {}.".format(
+            n_perturbations_per_edge))
+        print("Median total number of edges compared to compute quantiles is {}.".format(
+            median_n_totals))
+        print("Mean total number of edges compared to compute quantiles is {}.".format(
+            mean_n_totals))
+        print("Median quantile is {}.".format(median_quantile))
+        print("Mean quantile is {}.".format(mean_quantile))
+        print("Precision @ 10% is {}.".format(precision_at_10))
+        print("10th percentile of excess of known positive edge score over median perturbed edge score is {}".format(
+            quantiles_of_excess_over_median[0]))
+        print("50th percentile of excess of known positive edge score over median perturbed edge score is {}".format(
+            quantiles_of_excess_over_median[1]))
+        print("90th percentile of excess of known positive edge score over median perturbed edge score is {}".format(
+            quantiles_of_excess_over_median[2]))
+        print("10th percentile of ratio of excess to known positive score is {}.".format(
+            quantiles_of_excess_ratio[0]))
+        print("50th percentile of ratio of excess to known positive score is {}.".format(
+            quantiles_of_excess_ratio[1]))
+        print("90th percentile of ratio of excess to known positive score is {}.".format(
+            quantiles_of_excess_ratio[2]))
+
+        if output_filename is not None:
+            import json
+            with open(output_filename, 'wt', encoding='utf-8') as fp:
+                json.dump(dict(median_quantile=median_quantile,
+                               mean_quantile=mean_quantile,
+                               n_edges=n_edges,
+                               n_perturbations_per_edge=n_perturbations_per_edge,
+                               precision_at_10=precision_at_10,
+                               q10_of_excess=quantiles_of_excess_over_median[0],
+                               q50_of_excess=quantiles_of_excess_over_median[1],
+                               q90_of_excess=quantiles_of_excess_over_median[2],
+                               q10_of_excess_ratio=quantiles_of_excess_ratio[0],
+                               q50_of_excess_ratio=quantiles_of_excess_ratio[1],
+                               q90_of_excess_ratio=quantiles_of_excess_ratio[2]),
+                          fp)
 
     def export(self, dirname):
         """
@@ -583,113 +1011,57 @@ class SemanticMatchingModel(nn.Module):
         save_hdf(related_terms, str(path / "terms-related.h5"))
 
 
-def clip_grad_norm(parameters, max_norm, norm_type=2):
-    r"""Clips gradient norm of an iterable of parameters, just like 
-    nn.utils.clip_grad_norm_, but works even if some parameters are sparse.
-
-    The norm is computed over all gradients together, as if they were
-    concatenated into a single vector. Gradients are modified in-place.
-
-    Arguments:
-        parameters (Iterable[Tensor]): an iterable of Tensors that will have
-            gradients normalized
-        max_norm (float or int): max norm of the gradients
-        norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
-            infinity norm.
-
-    Returns:
-        Total norm of the parameters (viewed as a single vector).
-    """
-    # Torch sparse tensors may be stored un-coalesced (i.e., there can be
-    # more than one value assigned to each non-zero entry; the actual
-    # value of the tensor at that entry is the sum of those assigned values).
-    # Before computing the norm of a sparse tensor it must be coalesced, and
-    # after that it is only necessary to iterate over the non-zero entries to
-    # find the norm.
-    parameters = list(filter(lambda p: p.grad is not None, parameters))
-    max_norm = float(max_norm)
-    norm_type = float(norm_type)
-    if norm_type == float("inf"):
-
-        def L_inf_norm(tensor):
-            if tensor.layout == torch.sparse_coo:
-                if tensor._nnz() > 0:
-                    return tensor.coalesce()._values().abs().max()
-                else:
-                    return 0.0
-            else:
-                return tensor.abs().max()
-
-        total_norm = max(L_inf_norm(p.grad.data) for p in parameters)
-    else:
-        total_norm = 0
-        for p in parameters:
-            if p.grad.data.layout == torch.sparse_coo:
-                param_norm = p.grad.data.coalesce()._values().norm(norm_type)
-            else:
-                param_norm = p.grad.data.norm(norm_type)
-            total_norm += param_norm ** norm_type
-        total_norm = total_norm ** (1. / norm_type)
-    clip_coef = float(max_norm / (total_norm + 1e-6))
-    if clip_coef < 1:
-        for p in parameters:
-            p.grad.data.mul_(clip_coef)
-            if p.grad.data.layout == torch.sparse_coo:
-                p.grad.data = p.grad.data.coalesce()
-    return total_norm
-
-
 class DataParallelizedModule(nn.Module):
     """
-    Similarly to nn.DataParallel, this class of modules serves to wrap 
-    other modules and run them in parallel over multiple gpus, splitting 
-    training (or testing/application) batches between the gpus (over the 
-    first dimension of the batch, which is assumed to correspond to data 
-    points within the batch).  
-    
-    Unlike nn.DataParallel, all of the wrapped module's parameters will be 
-    copied to all gpus during construction of the wrapper, and only gradient 
-    data will be copied from gpu to gpu during training (no data should need 
-    to be copied between gpus during forward application).  However, training 
-    should only use loss functions that can be expressed as averages over all 
-    data points of a batch of some per-data-point loss.  Each training batch 
-    must be presented as a tuple of tensors all of which have equal sizes (or 
-    at least sizes in fixed proportions) in dimension 0 (corresponding to the 
-    points in the batch).  Also, the set of parameters of the wrapped module 
-    is assumed not to change (of course their values can change) over the 
+    Similarly to nn.DataParallel, this class of modules serves to wrap
+    other modules and run them in parallel over multiple gpus, splitting
+    training (or testing/application) batches between the gpus (over the
+    first dimension of the batch, which is assumed to correspond to data
+    points within the batch).
+
+    Unlike nn.DataParallel, all of the wrapped module's parameters will be
+    copied to all gpus during construction of the wrapper, and only gradient
+    data will be copied from gpu to gpu during training (no data should need
+    to be copied between gpus during forward application).  However, training
+    should only use loss functions that can be expressed as averages over all
+    data points of a batch of some per-data-point loss.  Each training batch
+    must be presented as a tuple of tensors all of which have equal sizes (or
+    at least sizes in fixed proportions) in dimension 0 (corresponding to the
+    points in the batch).  Also, the set of parameters of the wrapped module
+    is assumed not to change (of course their values can change) over the
     lifetime of the wrapper object.
-    
-    Note that during training of a wrapped module, it is necessary to call 
-    the wrapper's broadcast_gradients method immediately following the 
-    backpropagation of gradients (i.e. typically right after calling 
-    .backward on some loss tensor), in order to share corrections to the 
+
+    Note that during training of a wrapped module, it is necessary to call
+    the wrapper's broadcast_gradients method immediately following the
+    backpropagation of gradients (i.e. typically right after calling
+    .backward on some loss tensor), in order to share corrections to the
     computed gradients between the gpus.
-    
-    Specifically, if L is the average loss over an entire (mini-)batch, of 
-    size n data points, that batch is scattered over k gpus as chunks of 
-    sizes n_0, ..., n_(k-1) (with sum equal to n), and L_i is the average loss 
-    over the i-th chunk, then L = w_0 * L_0 + ... + w_k-1 * L_(k-1), where 
+
+    Specifically, if L is the average loss over an entire (mini-)batch, of
+    size n data points, that batch is scattered over k gpus as chunks of
+    sizes n_0, ..., n_(k-1) (with sum equal to n), and L_i is the average loss
+    over the i-th chunk, then L = w_0 * L_0 + ... + w_k-1 * L_(k-1), where
     w_i = n_i / n, and so for any parameter p
-    
+
         dL/dp = w_0 dL_0/dp + ... + w_(k-1) * dL_(k-1)/dp.
-    
-    The broadcast_gradients method collects the individual pieces of gradient 
-    data dL_i/dp from all the gpus, computes the unified gradient data dL/dp 
+
+    The broadcast_gradients method collects the individual pieces of gradient
+    data dL_i/dp from all the gpus, computes the unified gradient data dL/dp
     (for every parameter) and updates the gradients on every gpu.
     """
 
     def __init__(self, module, device, copy_fn, parallelize=True):
         """
-        Construct a parallelizing wrapper for the given module (an instance 
-        of nn.Module).  The module will be moved to the given device (if 
-        not already there) and copies will be made using the given copy 
-        function (which should accept a module and a device, and return a 
-        copy of the module suitable for placement on that device) and 
+        Construct a parallelizing wrapper for the given module (an instance
+        of nn.Module).  The module will be moved to the given device (if
+        not already there) and copies will be made using the given copy
+        function (which should accept a module and a device, and return a
+        copy of the module suitable for placement on that device) and
         moved to all other available gpus.
-        
-        If the (optional) parallelize argument is set to False, or if the 
-        requested device is the cpu, or if multiple gpus are not available, 
-        the model will be moved to the given device (if possible) for execution 
+
+        If the (optional) parallelize argument is set to False, or if the
+        requested device is the cpu, or if multiple gpus are not available,
+        the model will be moved to the given device (if possible) for execution
         there.
         """
         super().__init__()
@@ -754,9 +1126,9 @@ class DataParallelizedModule(nn.Module):
 
     def forward(self, *args):
         """
-        Scatter the supplied args (assumed to be a list of tensors) across 
-        the child modules, and gather their outputs (assumed to be single 
-        tensors) back to the first gpu.  Also, accumulate the sizes of the 
+        Scatter the supplied args (assumed to be a list of tensors) across
+        the child modules, and gather their outputs (assumed to be single
+        tensors) back to the first gpu.  Also, accumulate the sizes of the
         scattered chunks (for later use in updating parameter gradients).
         """
         # Data is scattered into chunks by splitting on dimension 0.
@@ -806,7 +1178,7 @@ class DataParallelizedModule(nn.Module):
 
     def zero_grad(self):
         """
-        In addition to the ordinary zeroing of gradient data, reset the 
+        In addition to the ordinary zeroing of gradient data, reset the
         chunk size data.
         """
         super().zero_grad()
@@ -814,10 +1186,10 @@ class DataParallelizedModule(nn.Module):
 
     def broadcast_gradients(self):
         """
-        Compute a single value, for all the child modules, of the gradient 
-        of each module parameter (as a convex combination of the gradients 
-        in the individual children, with coefficients proportional to the 
-        batch chunk sizes from the forward computation), and distribute these 
+        Compute a single value, for all the child modules, of the gradient
+        of each module parameter (as a convex combination of the gradients
+        in the individual children, with coefficients proportional to the
+        batch chunk sizes from the forward computation), and distribute these
         common gradients back to all the children.
         """
         if len(self.children) <= 1:
@@ -869,13 +1241,13 @@ class DataParallelizedModule(nn.Module):
 
     def synchronize_children(self, tolerance=5e-6):
         """
-        In principle, if broadcast_gradients is called on every training step, 
-        the child modules should always agree on all parameters.  In practice, 
-        some optimizers sometimes introduce slight discrepancies (e.g. 
-        optim.SGD with sparse gradients, which does not coalesce such gradients 
-        at every step).  This method can be called periodically to reset the 
-        parameters of all children to the values of the first child (the 
-        original module), and to print warnings if the parameters have diverged 
+        In principle, if broadcast_gradients is called on every training step,
+        the child modules should always agree on all parameters.  In practice,
+        some optimizers sometimes introduce slight discrepancies (e.g.
+        optim.SGD with sparse gradients, which does not coalesce such gradients
+        at every step).  This method can be called periodically to reset the
+        parameters of all children to the values of the first child (the
+        original module), and to print warnings if the parameters have diverged
         by more than the given (absolute) tolerance.
         """
         msg = "Warning: {} differs between parallelized models by {}."
@@ -893,70 +1265,57 @@ class DataParallelizedModule(nn.Module):
                 # Find its difference from the param on the first child.
                 difference = torch.norm(param_data_cpu - child_params[0].data.cpu())
                 if difference > tolerance:
-                    print(msg.format(name, difference))
+                    log_message(msg.format(name, difference))
                 # Copy the param to the child (but first free up space).
                 child_params[0].data = child_params[0].data.new_empty((0,))
                 child_params[0].data = param_data_cpu.to(device)
 
+def _model_copier(model, device):
+    """
+    Function to copy SemanticMatchingModels from one gpu to another, for use 
+    with DataParallelizedModule.
+    """
+    model.cpu()
+    frame = pd.DataFrame(model.term_vecs.weight.data.numpy(), index=model.index)
+    new_model = SemanticMatchingModel(frame, use_cuda=False)
+    new_model.load_state_dict(model.state_dict())
+    new_model.device = device
+    new_model.to(device)
+    return new_model
 
-def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False):
+
+def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False,
+                validation_dataset=None):
     """
     Incrementally train the model on the given dataset.
 
-    If a positive number of batch worker processes is requested, generation 
-    of training data batches will be done in parallel across multiple CPU cores 
+    If a positive number of batch worker processes is requested, generation
+    of training data batches will be done in parallel across multiple CPU cores
     by spawning that number of child processes.
 
-    If use of multiple GPUs is requested (and they are available), evaluation 
+    If use of multiple GPUs is requested (and they are available), evaluation
     of batches will be parallelized across all available GPUs.
 
+    If a validation dataset is given, every 1000 training batch iterations 
+    the loss over 50 batches from this dataset (which should be distinct 
+    from the training data) will be printed.
+
     As it is, this function will never return. It writes the results so far
-    to `sme/sme.model` every 5000 iterations, and you can run it for as
+    to `sme/sme.model` every 1000 iterations, and you can run it for as
     long as you want.
     """
-    print("Starting model training.")
+    log_message("Starting model training.")
     model.train()
 
-    print("Making parallelized model.")
-    def model_copier(model, device):
-        model.cpu()
-        frame = pd.DataFrame(model.term_vecs.weight.data.numpy(), index=model.index)
-        new_model = SemanticMatchingModel(frame, use_cuda=False)
-        new_model.load_state_dict(model.state_dict())
-        new_model.device = device
-        new_model.to(device)
-        return new_model
+    log_message("Making parallelized model.")
 
-    parallel_model = DataParallelizedModule(model, model.device, copy_fn=model_copier, parallelize=use_multiple_gpus)
+    parallel_model = DataParallelizedModule(model, model.device, copy_fn=_model_copier, parallelize=use_multiple_gpus)
 
-    # Relative loss says that the positive examples should outrank their
-    # corresponding negative examples, with a difference of at least 1
-    # logit between them. If the difference is less than this (especially
-    # if it's negative), this adds to the relative loss.
-    print("Making loss functions.")
-    relative_loss_function = nn.MarginRankingLoss(margin=1)
-
-    # Absolute loss measures the cross-entropy of the predictions:
-    # true statements should get positive values, false statements should
-    # get negative values, and the sigmoid of those values should be a
-    # probability that accurately reflects the model's confidence.
-    absolute_loss_function = nn.BCEWithLogitsLoss()
-
-    print("Making optimizer.")
+    log_message("Making optimizer.")
     optimizer = optim.SGD(parallel_model.parameters(), lr=0.1)
-    losses = []
-
-    print("Making loss targets.")
-    true_target = torch.ones(
-        [BATCH_SIZE], dtype=torch.float32, device=parallel_model.device
-    )
-    false_target = torch.zeros(
-        [BATCH_SIZE], dtype=torch.float32, device=parallel_model.device
-    )
-    steps = 0
 
     # Note that you want drop_last=False with a CyclingSampler.
-    print("Making data loader.")
+    log_message("Making data loader.")
     data_loader = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
@@ -966,40 +1325,42 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False):
         sampler=CyclingSampler(dataset),
         pin_memory=True,
     )
+    if validation_dataset is not None:
+        # Take a smallish number of validation edges from the front of the
+        # validation dataset provided.
+        n_validation_samples = np.min([N_VALIDATION_BATCHES * BATCH_SIZE, len(validation_dataset)])
+        validation_data_loader = DataLoader(
+            validation_dataset,
+            batch_size=BATCH_SIZE,
+            drop_last=True,
+            num_workers=num_batch_workers,
+            collate_fn=validation_dataset.collate_batch,
+            sampler=SubsetSequentialSampler(n_validation_samples),
+            pin_memory=True
+        )
 
-    print("Entering training (batch) loop.")
-    for pos_batch, neg_batch, weights in data_loader:
+    losses = []
+    steps = 0
+
+    log_message("Entering training (batch) loop.")
+    for batch in data_loader:
         if parallel_model.device != torch.device("cpu"):
-            pos_batch = tuple(
+            batch = tuple(
                 x.cuda(device=parallel_model.device, non_blocking=True)
-                for x in pos_batch
+                for x in batch
             )
-            neg_batch = tuple(
-                x.cuda(device=parallel_model.device, non_blocking=True)
-                for x in neg_batch
-            )
-            weights = weights.cuda(device=parallel_model.device, non_blocking=True)
 
         parallel_model.zero_grad()
+        rels, lefts, rights, weights, targets = batch
 
-        pos_energy = parallel_model(*pos_batch)
-        neg_energy = parallel_model(*neg_batch)
-
-        abs_loss = absolute_loss_function(pos_energy, true_target)
-        rel_loss = 0
-        for neg_index in range(NEG_SAMPLES):
-            neg_energy_slice = neg_energy[neg_index::NEG_SAMPLES]
-            rel_loss += relative_loss_function(
-                pos_energy, neg_energy_slice, true_target
-            )
-            abs_loss += absolute_loss_function(neg_energy_slice, false_target)
-
-        loss = abs_loss + rel_loss
+        energy = parallel_model(rels, lefts, rights)
+        loss_function = nn.BCEWithLogitsLoss(weight=weights)
+        loss = loss_function(energy, targets)
         loss.backward()
 
         parallel_model.broadcast_gradients()
         for model_copy in parallel_model.children:
-            clip_grad_norm(model_copy.parameters(), 1)
+            nn.utils.clip_grad_norm_(model_copy.parameters(), 1)
 
         optimizer.step()
 
@@ -1010,18 +1371,16 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False):
         steps += 1
 
         if steps in (1, 10, 20, 50, 100) or steps % 100 == 0:
-            model.show_debug(neg_batch, neg_energy, False)
-            model.show_debug(pos_batch, pos_energy, True)
             avg_loss = np.mean(losses)
-            print(
-                "%d steps, loss=%4.4f, abs=%4.4f, rel=%4.4f"
-                % (steps, avg_loss, abs_loss, rel_loss)
+            log_message(
+                "%d steps, loss=%4.4f"
+                % (steps, avg_loss)
             )
             losses.clear()
 
-        if steps % 5000 == 0:
+        if steps % 1000 == 0:
             incremental_accum = TimeAccumulator()
-            print("Saving model.")
+            log_message("Saving model.")
             with stopwatch(incremental_accum):
                 model.cpu()
             incremental_accum.print("Moving model to cpu took", accumulated_time=0.0)
@@ -1032,7 +1391,7 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False):
             with stopwatch(incremental_accum):
                 model.to(model.device)
             incremental_accum.print("Moving model back to its device took", accumulated_time=0.0)
-            print("saved")
+            log_message("saved")
 
             # With optim.SGD as the optimizer and when the model is
             # parallelized across multiple GPU's we see slight divergences
@@ -1041,12 +1400,44 @@ def train_model(model, dataset, num_batch_workers=0, use_multiple_gpus=False):
             # every training iteration.)  So we force agreement between the
             # children periodically.
 
-            print("Synchronizing parallel model.")
+            log_message("Synchronizing parallel model.")
             with stopwatch(incremental_accum):
                 parallel_model.synchronize_children()
             incremental_accum.print("Synchonizing took", accumulated_time=0.0)
 
-    print()
+            # If a validation dataset was given, show the loss over (some of)
+            # the validation data.
+            if validation_dataset is not None:
+                log_message("Evaluating loss over validation data.")
+                model.eval()  # turn off training mode temporarily
+                validation_loss = torch.tensor(0, dtype=torch.float32,
+                                               device=parallel_model.device)
+                
+                # Take the specified number of batches from the validation
+                # dataset via the data (loader) iterator.
+                for batch in validation_data_loader:
+                    if parallel_model.device != torch.device("cpu"):
+                        batch = tuple(
+                            x.cuda(device=parallel_model.device, non_blocking=True)
+                            for x in batch
+                        )
+
+                    rels, lefts, rights, weights, targets = batch
+
+                    energy = parallel_model(rels, lefts, rights)
+                    loss_function = nn.BCEWithLogitsLoss(weight=weights)
+                    loss = loss_function(energy, targets)
+                    validation_loss += loss
+                
+                validation_loss /= N_VALIDATION_BATCHES  # mean over batches
+                validation_loss = validation_loss.data.cpu().item()
+                log_message("Validation loss (mean over {} batches) is {}.".format(
+                    N_VALIDATION_BATCHES,
+                    validation_loss
+                ))
+                model.train()  # reset to train mode
+                
+    log_message()
 
 
 def get_model():
@@ -1055,19 +1446,19 @@ def get_model():
     by creating it from scratch if nothing is there.
     """
     if os.access(MODEL_FILENAME, os.F_OK):
-        print("Loading previously saved model.")
+        log_message("Loading previously saved model.")
         model = SemanticMatchingModel.load_model(MODEL_FILENAME)
     else:
-        print("Creating a new model.")
+        log_message("Creating a new model.")
         total_accum = TimeAccumulator()
         incremental_accum = TimeAccumulator()
         with stopwatch(total_accum):
             frame = SemanticMatchingModel.load_initial_frame()
-        print("Normalizing initial frame.")
+        log_message("Normalizing initial frame.")
         with stopwatch(total_accum), stopwatch(incremental_accum):
             frame = l2_normalize_rows(frame)
         incremental_accum.print('Normalizing frame took', accumulated_time=0.0)
-        print('Constructing model from frame.')
+        log_message('Constructing model from frame.')
         with stopwatch(total_accum), stopwatch(incremental_accum):
             model = SemanticMatchingModel(frame)
         incremental_accum.print("Construction took", accumulated_time=0.0)
@@ -1076,13 +1467,23 @@ def get_model():
 
 
 if __name__ == "__main__":
-    print("Starting semantic matching.")
+    _message_writer = _MessageWriter()
+    log_message("Starting semantic matching.")
     model = get_model()
-    print("Initializing edge dataset ....")
+    log_message("Initializing edge dataset ....")
     dataset_accumulator = TimeAccumulator()
     with stopwatch(dataset_accumulator):
-        dataset = EdgeDataset(EDGES_FILENAME, model.index)
-    dataset_accumulator.print("Edge dataset initialization took")
-    print("Edge dataset contains {} edges.".format(len(dataset)))
-    train_model(model, dataset, num_batch_workers=NUM_BATCH_WORKERS, use_multiple_gpus=USE_MULTIPLE_GPUS)
-    # model.evaluate_conceptnet(dataset)
+        dataset = EdgeDataset(EDGES_FILENAME, model)
+    dataset_accumulator.print("Edge dataset initialization took",
+                              accumulated_time=0.0)
+    log_message("Edge dataset contains {} edges.".format(len(dataset)))
+    validation_dataset = None
+    if os.path.isfile(VALIDATION_FILENAME):
+        log_message("Initializing validation dataset ....")
+        with stopwatch(dataset_accumulator):
+            validation_dataset = EdgeDataset(VALIDATION_FILENAME, model)
+        dataset_accumulator.print("Validation dataset initialization took")
+        log_message("Validation dataset contains {} edges.".format(len(validation_dataset)))
+    train_model(model, dataset, num_batch_workers=NUM_BATCH_WORKERS, use_multiple_gpus=USE_MULTIPLE_GPUS, validation_dataset=validation_dataset)
+    # model.evaluate_conceptnet(EDGES_FILENAME)
+    del _message_writer
