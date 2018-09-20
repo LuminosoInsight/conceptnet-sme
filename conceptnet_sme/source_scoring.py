@@ -46,62 +46,21 @@ def read_edges(root):
                 yield (rel, left, right, dataset, source)
 
 
-def get_datasets_and_sources(root):
-    """
-    Read all csv files (assumed to be ConceptNet edge files) under the given 
-    root (typically $CONCEPTNET_DATA/edges or a single edge csv file) and 
-    return a pair of sets containing the (names of) all the datasets and all 
-    the data source fields mentioned in any edge.
-    """
-    datasets = set()
-    sources = set()
-    for _, _, _, dataset, source in read_edges(root):
-        datasets.add(dataset)
-        sources.add(source)
-    return datasets, sources
-
-def get_dataset_edges(root, desired_dataset):
-    """
-    Read all csv files (assumed to be ConceptNet edge files) under the given 
-    root (typically $CONCEPTNET_DATA/edges or a single edge csv file) and 
-    generate one three-tuple for every edge they contain from the given dataset, 
-    consisting of the relation, and the (uri-prefixes of the) left and right 
-    endpoints.
-    """
-    for rel, left, right, dataset, _ in read_edges(root):
-        if dataset == desired_dataset:
-            yield (rel, left, right)
-
-def get_source_edges(root, desired_source):
-    """
-    Read all csv files (assumed to be ConceptNet edge files) under the given 
-    root (typically $CONCEPTNET_DATA/edges or a single edge csv file) and 
-    generate one three-tuple for every edge they contain from the given source 
-    (defined here as the 'sources' field of the json data for the edge), consisting 
-    of the relation, and the (uri-prefixes of the) left and right endpoints.
-    """
-    for rel, left, right, _, source in read_edges(root):
-        if source == desired_source:
-            yield (rel, left, right)
-
-def evaluate_sources(model, root, device=None, batch_size=2, convert_logits_to_probas=False):
+def evaluate_sources(model, root, **kwargs):
     """
     Read all csv files (assumed to be ConceptNet edge files) under the given 
     root (typically $CONCEPTNET_DATA/edges or a single edge csv file) and 
     return two dicts, one mapping each dataset found to a dict mapping edges 
     from that dataset to their scores as returned by the model's score_edges 
     method, and the other similarly mapping each source found to edge scores.  
-    The optional arguments device (default None), batch_size (default 128), and 
-    convert_logits_to_probas (default False) will be passed to the model's 
+    Other (optional) keyword arguments will be passed to the model's 
     score_edges method.
     """
     scores_by_dataset = defaultdict(dict)
     scores_by_source = defaultdict(dict)
     for score, (rel, left, right, dataset, sources) in model.score_edges(
             read_edges(root),
-            device=device,
-            batch_size=batch_size,
-            convert_logits_to_probas=convert_logits_to_probas
+            **kwargs
     ):
         edge = (rel, left, right)
         scores_by_dataset[dataset][edge] = score
@@ -134,10 +93,13 @@ def load_scores(path):
 
 def composite_scores(raw_scores):
     """
-    Convert a dict of per-data-source score dicts into two single scores per 
-    data source, the mean score assigned and the fraction of the total over 
-    all edges scored (which in the case of probability rather than logit scaled 
-    scores correspond roughtly to precision and (approximately) recall.
+    Convert a dict of per-data-source score dicts (as returned by evaluate_sources) 
+    into two single scores per data source: (1) the mean score assigned to edges 
+    from that data source, and (2) the ratio of the total of the scores assigned 
+    to edges from that source to the total over all edges from any source (which 
+    in the case of probability rather than logit scaled scores correspond roughly 
+    to precision and (approximately) recall for each source, assuming the model 
+    assigns fairly accurate estimates of the probability of truth to each edge).
     """
     result = {}
     pooled_edge_scores = {}

@@ -599,23 +599,21 @@ class SemanticMatchingModel(nn.Module):
 
             # Keep track of where to insert, and when a batch is full.
             position_in_batch += 1
-            if position_in_batch < batch_size:
-                continue
-
-            # Handle a full batch buffer.
-
-            input_batch_on_device = input_batch.cuda(device, non_blocking=True)
-            output_batch = parallel_model(
-                input_batch_on_device[0], input_batch_on_device[1], input_batch_on_device[2]
-            )
-            output_batch.detach_() # requiring grad prevents calling numpy()
-            if convert_logits_to_probas:
-                output_batch.sigmoid_()
-            output_batch = output_batch.cpu().numpy()
-            for i_edge in range(batch_size):
-                yield output_batch[i_edge], input_batch_edges[i_edge]
-            position_in_batch = 0 # setup next batch
-            input_batch_edges = []
+            if position_in_batch >= batch_size:
+                
+                # Handle a full batch buffer.
+                input_batch_on_device = input_batch.cuda(device, non_blocking=True)
+                output_batch = parallel_model(
+                    input_batch_on_device[0], input_batch_on_device[1], input_batch_on_device[2]
+                )
+                output_batch.detach_() # requiring grad prevents calling numpy()
+                if convert_logits_to_probas:
+                    output_batch.sigmoid_()
+                output_batch = output_batch.cpu().numpy()
+                for i_edge in range(batch_size):
+                    yield output_batch[i_edge], input_batch_edges[i_edge]
+                position_in_batch = 0 # setup next batch
+                input_batch_edges = []
 
         # Handle any final (shorter than normal) batch.
         # Note that we evaluate a full-size batch in case the actual size
@@ -863,7 +861,7 @@ class SemanticMatchingModel(nn.Module):
                 edge_list.append((rel_idx, left_idx, right_idx))
 
         if not 0 <= n_edges <= len(edge_set):
-            n_edges = len(edges)
+            n_edges = len(edge_set)
 
         print("Compiling statistics.")
         # To enable batched evaluation of edges by the model, define an
