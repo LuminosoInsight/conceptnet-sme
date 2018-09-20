@@ -568,7 +568,9 @@ class SemanticMatchingModel(nn.Module):
         # evaluation, for efficiency's sake.  As torch tensors are stored row-major,
         # and the model expects three tensors as input, we make batches of size
         # 3 x b, then split them by rows to feed them to the model.
-        input_batch = torch.empty(
+        # In case the real inputs do not fill the first batch, it is necessary
+        # to initialize it to valid index values (like zero).
+        input_batch = torch.zeros(
             [3, batch_size], dtype=torch.int64, requires_grad=False)
         input_batch.pin_memory() # speed up any transfer to gpu
         input_batch_on_device = torch.empty_like(input_batch, device=device)
@@ -633,6 +635,8 @@ class SemanticMatchingModel(nn.Module):
             output_batch = output_batch.cpu().numpy()
             for i_edge in range(position_in_batch):
                 yield output_batch[i_edge], input_batch_edges[i_edge]
+
+        del parallel_model  # free resources consumed by the extra children
 
     def make_edge_score_file(self, input_filename, output_filename, **kwargs):
         """
@@ -1116,6 +1120,15 @@ class DataParallelizedModule(nn.Module):
         # handed off to each child.  So we create a 1D tensor holding those
         # sizes.
         self.chunk_sizes = torch.zeros(len(self.children), dtype=torch.int64)
+
+    def __del__(self):
+        """
+        Ensure that any memory allocated on GPU's is freed when this 
+        module is no longer referenced.
+        """
+        for child in self.children[1:]:
+            del child
+        torch.cuda.empty_cache()
 
     @property
     def device(self):
